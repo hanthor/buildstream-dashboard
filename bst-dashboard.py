@@ -1,29 +1,58 @@
 #!/usr/bin/env python3
 """BuildStream live build dashboard.
 
-Tails /var/tmp/aurora-build.log and serves a live HTML dashboard on :8765.
-Run: python3 bst-dashboard.py
+Tails a BST build log and serves a live HTML dashboard.
+
+Usage:
+    python3 bst-dashboard.py [OPTIONS]
+
+Options:
+    --log FILE        Build log to tail (default: $BST_LOG or /var/tmp/bst-build.log)
+    --port PORT       HTTP port (default: $BST_DASHBOARD_PORT or 8765)
+    --target TARGET   BST element to build via the Start button (default: $BST_TARGET or oci/aurora.bst)
+    --project DIR     Project source directory mounted into container (default: $BST_PROJECT or script dir)
+    --bst-image IMAGE BST2 container image (default: $BST2_IMAGE or auto-detect from running container)
+    --help            Show this message
 """
 
 import re
 import os
+import sys
 import time
 import json
+import argparse
 import datetime
 import threading
 import subprocess
 import multiprocessing
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-LOG_FILE = "/var/tmp/aurora-build.log"
-PORT = 8765
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Same image the Justfile uses
-BST2_IMAGE = os.environ.get(
-    "BST2_IMAGE",
-    "registry.gitlab.com/freedesktop-sdk/infrastructure/freedesktop-sdk-docker-images/bst2:f89b4aef847ef040b345acceda15a850219eb8f1",
+_DEFAULT_BST2_IMAGE = (
+    "registry.gitlab.com/freedesktop-sdk/infrastructure/"
+    "freedesktop-sdk-docker-images/bst2:f89b4aef847ef040b345acceda15a850219eb8f1"
 )
+
+def _parse_args():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--log",       default=None)
+    p.add_argument("--port",      type=int, default=None)
+    p.add_argument("--target",    default=None)
+    p.add_argument("--project",   default=None)
+    p.add_argument("--bst-image", default=None, dest="bst_image")
+    p.add_argument("--help", "-h", action="store_true")
+    args, _ = p.parse_known_args()
+    if args.help:
+        print(__doc__)
+        sys.exit(0)
+    return args
+
+_args = _parse_args()
+
+LOG_FILE    = _args.log       or os.environ.get("BST_LOG",              "/var/tmp/bst-build.log")
+PORT        = _args.port      or int(os.environ.get("BST_DASHBOARD_PORT", "8765"))
+BST_TARGET  = _args.target    or os.environ.get("BST_TARGET",           "oci/aurora.bst")
+PROJECT_DIR = _args.project   or os.environ.get("BST_PROJECT",          os.path.dirname(os.path.abspath(__file__)))
+BST2_IMAGE  = _args.bst_image or os.environ.get("BST2_IMAGE",           _DEFAULT_BST2_IMAGE)
 
 # ── Build process control ──────────────────────────────────────────────────────
 BUILD_LOCK = threading.Lock()
@@ -69,7 +98,7 @@ def start_build() -> bool:
             "bash", "-c", 'bst --colors "$@"', "--",
             "--max-jobs", str(max(1, nproc // 2)),
             "--fetchers", str(nproc),
-            "build", "oci/aurora.bst",
+            "build", BST_TARGET,
         ]
         BUILD_PROC = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
         return True
@@ -1074,8 +1103,11 @@ if __name__ == "__main__":
     tailer.start()
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"BST Dashboard running at http://localhost:{PORT}/")
-    print(f"Tailing {LOG_FILE}")
+    print(f"BST Dashboard  http://localhost:{PORT}/")
+    print(f"  log:     {LOG_FILE}")
+    print(f"  target:  {BST_TARGET}")
+    print(f"  project: {PROJECT_DIR}")
+    print(f"  image:   {BST2_IMAGE[:60]}…" if len(BST2_IMAGE) > 60 else f"  image:   {BST2_IMAGE}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
