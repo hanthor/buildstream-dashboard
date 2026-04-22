@@ -170,6 +170,7 @@ class State:
                 "catching_up": self.catching_up,
                 "build_running": build_running(),
                 "version": self.version,
+                "sysinfo": dict(_sysinfo),
             }
 
     def update(self, fn):
@@ -179,6 +180,93 @@ class State:
 
 
 STATE = State()
+
+# ── System resource sampling ───────────────────────────────────────────────────
+
+_sysinfo_lock = threading.Lock()
+_sysinfo = {"cpu_pct": 0.0, "mem_used": 0, "mem_total": 0,
+            "bst_cpu_pct": None, "bst_mem": None}
+_cpu_prev: tuple = (0, 0)   # (idle_ticks, total_ticks)
+
+
+def _read_proc_stat() -> tuple[int, int]:
+    """Return (idle_ticks, total_ticks) from /proc/stat aggregate cpu line."""
+    with open("/proc/stat") as f:
+        parts = f.readline().split()          # cpu  user nice system idle iowait ...
+    vals = list(map(int, parts[1:8]))          # user nice system idle iowait irq softirq
+    idle  = vals[3] + vals[4]                  # idle + iowait
+    total = sum(vals)
+    return idle, total
+
+
+def _read_proc_meminfo() -> tuple[int, int]:
+    """Return (used_bytes, total_bytes) from /proc/meminfo."""
+    info: dict[str, int] = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            info[k.strip()] = int(v.split()[0])   # kB
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", 0)
+    return (total - avail) * 1024, total * 1024
+
+
+def _bst_container_stats() -> tuple[float | None, int | None]:
+    """Return (cpu_pct, mem_bytes) for the running BST container, or (None, None)."""
+    cid = _bst_container_id()
+    if not cid:
+        return None, None
+    try:
+        r = subprocess.run(
+            ["podman", "stats", "--no-stream", "--format",
+             "{{.CPUPerc}},{{.MemUsage}}", cid],
+            capture_output=True, text=True, timeout=3,
+        )
+        line = r.stdout.strip()
+        if not line:
+            return None, None
+        cpu_str, mem_str = line.split(",", 1)
+        cpu = float(cpu_str.strip().rstrip("%"))
+        # mem_str like "1.23GiB / 31.7GiB" — grab the used part
+        mem_used_str = mem_str.split("/")[0].strip()
+        mul = 1
+        for suffix, factor in [("GiB", 1 << 30), ("MiB", 1 << 20), ("kB", 1000)]:
+            if mem_used_str.endswith(suffix):
+                mul = factor
+                mem_used_str = mem_used_str[:-len(suffix)]
+                break
+        mem_bytes = int(float(mem_used_str) * mul)
+        return cpu, mem_bytes
+    except Exception:
+        return None, None
+
+
+def _sysinfo_sampler():
+    global _cpu_prev
+    while True:
+        try:
+            idle, total = _read_proc_stat()
+            prev_idle, prev_total = _cpu_prev
+            d_total = total - prev_total
+            cpu_pct = round(100.0 * (1.0 - (idle - prev_idle) / d_total), 1) if d_total else 0.0
+            _cpu_prev = (idle, total)
+
+            mem_used, mem_total = _read_proc_meminfo()
+            bst_cpu, bst_mem = _bst_container_stats()
+
+            with _sysinfo_lock:
+                _sysinfo["cpu_pct"]     = max(0.0, min(100.0, cpu_pct))
+                _sysinfo["mem_used"]    = mem_used
+                _sysinfo["mem_total"]   = mem_total
+                _sysinfo["bst_cpu_pct"] = bst_cpu
+                _sysinfo["bst_mem"]     = bst_mem
+        except Exception:
+            pass
+        time.sleep(2)
+
+
+threading.Thread(target=_sysinfo_sampler, daemon=True).start()
+
 
 # ── Log parser ─────────────────────────────────────────────────────────────────
 
@@ -520,6 +608,14 @@ HTML = """<!DOCTYPE html>
   #log-modal-close:hover, #log-modal-close:active { color: var(--text); }
   #log-modal-body { flex: 1; overflow-y: auto; padding: 10px 14px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: var(--muted); -webkit-overflow-scrolling: touch; }
 
+  /* ── Sysinfo bar ── */
+  #sysinfo-wrap { padding: 2px 16px 8px; display: flex; gap: 20px; flex-wrap: wrap; }
+  .si-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+  .si-lbl { min-width: 30px; font-weight: 600; }
+  .si-bar-bg { width: 80px; height: 7px; background: var(--surface); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
+  .si-bar { height: 100%; border-radius: 3px; transition: width .8s ease, background-color .8s; }
+  .si-txt { min-width: 54px; }
+
   /* ── Mobile layout ── */
   @media (max-width: 640px) {
     body { font-size: 14px; }
@@ -571,6 +667,24 @@ HTML = """<!DOCTYPE html>
     <span class="pb-legend"><span class="pb-dot" style="background:var(--blue)"></span><span id="lb-active">0 building</span></span>
     <span class="pb-legend"><span class="pb-dot" style="background:var(--red)"></span><span id="lb-failed">0 failed</span></span>
     <span id="lb-total" style="margin-left:auto"></span>
+  </div>
+</div>
+
+<div id="sysinfo-wrap">
+  <div class="si-item">
+    <span class="si-lbl">CPU</span>
+    <div class="si-bar-bg"><div id="si-cpu-bar" class="si-bar" style="width:0%;background:var(--blue)"></div></div>
+    <span class="si-txt" id="si-cpu-txt">–</span>
+  </div>
+  <div class="si-item">
+    <span class="si-lbl">RAM</span>
+    <div class="si-bar-bg"><div id="si-ram-bar" class="si-bar" style="width:0%;background:var(--green)"></div></div>
+    <span class="si-txt" id="si-ram-txt">–</span>
+  </div>
+  <div class="si-item" id="si-bst-wrap" style="display:none">
+    <span class="si-lbl">BST</span>
+    <div class="si-bar-bg"><div id="si-bst-bar" class="si-bar" style="width:0%;background:var(--yellow)"></div></div>
+    <span class="si-txt" id="si-bst-txt">–</span>
   </div>
 </div>
 
@@ -689,6 +803,33 @@ async function poll() {
     const suffix = !d.live && d.done > 0 ? ' · last build' : '';
     document.getElementById('lb-total').textContent =
       `${d.done}${d.total ? ' / ' + d.total : ''} · ${overallPct}%${suffix}`;
+
+    // Sysinfo bars
+    const si = d.sysinfo || {};
+    const cpuPct = si.cpu_pct || 0;
+    const cpuColor = cpuPct > 85 ? 'var(--red)' : cpuPct > 60 ? 'var(--yellow)' : 'var(--blue)';
+    document.getElementById('si-cpu-bar').style.width = cpuPct + '%';
+    document.getElementById('si-cpu-bar').style.background = cpuColor;
+    document.getElementById('si-cpu-txt').textContent = cpuPct.toFixed(1) + '%';
+    if (si.mem_total) {
+      const memPct = Math.round(si.mem_used / si.mem_total * 100);
+      const memColor = memPct > 85 ? 'var(--red)' : memPct > 65 ? 'var(--yellow)' : 'var(--green)';
+      const memUsedGb = (si.mem_used / 1073741824).toFixed(1);
+      const memTotalGb = (si.mem_total / 1073741824).toFixed(1);
+      document.getElementById('si-ram-bar').style.width = memPct + '%';
+      document.getElementById('si-ram-bar').style.background = memColor;
+      document.getElementById('si-ram-txt').textContent = memUsedGb + ' / ' + memTotalGb + ' GB';
+    }
+    const bstWrap = document.getElementById('si-bst-wrap');
+    if (si.bst_cpu_pct !== null && si.bst_cpu_pct !== undefined) {
+      bstWrap.style.display = '';
+      const bstPct = Math.min(100, si.bst_cpu_pct);
+      document.getElementById('si-bst-bar').style.width = bstPct + '%';
+      const bstMemGb = si.bst_mem ? (si.bst_mem / 1073741824).toFixed(1) + 'GB' : '';
+      document.getElementById('si-bst-txt').textContent = bstPct.toFixed(1) + '% ' + bstMemGb;
+    } else {
+      bstWrap.style.display = 'none';
+    }
 
     // Active jobs
     const activeEl = document.getElementById('active-list');
