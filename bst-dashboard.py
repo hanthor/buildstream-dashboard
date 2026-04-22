@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""BuildStream live build dashboard.
+
+Tails /var/tmp/aurora-build.log and serves a live HTML dashboard on :8765.
+Run: python3 bst-dashboard.py
+"""
+
+import re
+import os
+import time
+import json
+import datetime
+import threading
+import subprocess
+import multiprocessing
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+LOG_FILE = "/var/tmp/aurora-build.log"
+PORT = 8765
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Same image the Justfile uses
+BST2_IMAGE = os.environ.get(
+    "BST2_IMAGE",
+    "registry.gitlab.com/freedesktop-sdk/infrastructure/freedesktop-sdk-docker-images/bst2:f89b4aef847ef040b345acceda15a850219eb8f1",
+)
+
+# ── Build process control ──────────────────────────────────────────────────────
+BUILD_LOCK = threading.Lock()
+BUILD_PROC: "subprocess.Popen | None" = None
+
+
+def _bst_container_id() -> str:
+    """Return container ID of any running BST2 container, or empty string."""
+    try:
+        result = subprocess.run(
+            ["podman", "ps", "-q", "--filter", f"ancestor={BST2_IMAGE}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def build_running() -> bool:
+    if BUILD_PROC is not None and BUILD_PROC.poll() is None:
+        return True
+    return bool(_bst_container_id())
+
+
+def start_build() -> bool:
+    global BUILD_PROC
+    with BUILD_LOCK:
+        if build_running():
+            return False
+        nproc = multiprocessing.cpu_count()
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "buildstream")
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(LOG_FILE, "w") as f:
+            f.write(f"=== Build started at {datetime.datetime.now().strftime('%c')} ===\n")
+        log_f = open(LOG_FILE, "a")
+        cmd = [
+            "podman", "run", "--rm",
+            "--privileged", "--device", "/dev/fuse", "--network=host",
+            "-v", f"{PROJECT_DIR}:/src:rw",
+            "-v", f"{cache_dir}:/root/.cache/buildstream:rw",
+            "-w", "/src",
+            BST2_IMAGE,
+            "bash", "-c", 'bst --colors "$@"', "--",
+            "--max-jobs", str(max(1, nproc // 2)),
+            "--fetchers", str(nproc),
+            "build", "oci/aurora.bst",
+        ]
+        BUILD_PROC = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+        return True
+
+
+def stop_build() -> bool:
+    global BUILD_PROC
+    with BUILD_LOCK:
+        killed = False
+        if BUILD_PROC is not None and BUILD_PROC.poll() is None:
+            BUILD_PROC.terminate()
+            killed = True
+        cid = _bst_container_id()
+        if cid:
+            try:
+                subprocess.run(["podman", "stop", cid], timeout=10)
+                killed = True
+            except Exception:
+                pass
+        return killed
+
+# Strip ANSI escape codes
+ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHF]|\x1b\[[0-9;]*m")
+
+# "=== Build started at Tue Apr 22 03:00:00 IST 2026 ==="
+BUILD_HEADER_RE = re.compile(r"=== Build started at (.+?) ===")
+
+# Match a structured BST log line
+LINE_RE = re.compile(
+    r"^\[(?P<time>[0-9\-:]+)\]\[(?P<hash>[0-9a-f ]+)\]\[(?P<ctx>[^\]]+)\]\s+"
+    r"(?P<status>START\s+|SUCCESS|FAILURE|SKIPPED|STATUS\s+|INFO\s+|WARN\s+|PULL\s+)\s*"
+    r"(?P<msg>.*)$"
+)
+
+# Identify a top-level build event (the line that has the log file path)
+BUILD_LOG_RE = re.compile(r"[a-z0-9_\-]+(?:/[a-zA-Z0-9_.\-]+)+\.log$")
+
+# Pipeline Summary lines
+PIPELINE_SUMMARY_RE = re.compile(r"^Pipeline Summary\s*$")
+SUMMARY_TOTAL_RE    = re.compile(r"^\s+Total:\s+(\d+)")
+SUMMARY_QUEUE_RE    = re.compile(r"^\s+(Pull|Build) Queue:\s+processed (\d+), skipped (\d+), failed (\d+)")
+
+# Failure Summary element lines: "    kde-build-meta.bst:kde/plasma/foo.bst:"
+FAILURE_ELEM_RE = re.compile(r"^\s+([\w\-]+\.bst:)?kde/[\w/.\-]+\.bst:\s*$")
+
+# Log path line inside failure output: "    /root/.cache/buildstream/logs/gnome/..."
+BST_LOG_PATH_RE = re.compile(r"^\s+/root/\.cache/buildstream/logs/(\S+\.log)\s*$")
+
+# Parse element name from context
+ELEMENT_RE = re.compile(r"\s*(\w+):(.+)")
+
+# ── State ──────────────────────────────────────────────────────────────────────
+
+class State:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active: dict = {}
+        self.completed: list = []
+        self.failures: list = []
+        self._summary_elements: set = set()  # elements named in BST Failure Summary
+        self.pulled: int = 0
+        self.success_count: int = 0
+        self.failure_count: int = 0
+        self.cached_count: int = 0    # build-queue skipped (already in local cache)
+        self.total_elements: int = 0  # from Pipeline Summary "Total: N"
+        self.recent_lines: list = []
+        # Wall-clock timestamps from the log file itself
+        self.build_start_ts: float = 0.0   # parsed from "=== Build started at ==="
+        self.build_end_ts: float = 0.0     # mtime of log file when build last changed
+        self.catching_up: bool = True       # True while doing initial log replay
+        self.version = 0
+
+    def snapshot(self):
+        with self._lock:
+            live = bool(self.active) or self.catching_up
+            if live:
+                # Build is running: elapsed = now - start
+                elapsed = int(time.time() - self.build_start_ts) if self.build_start_ts else 0
+            elif self.build_end_ts and self.build_start_ts:
+                # Build finished: show actual duration
+                elapsed = int(self.build_end_ts - self.build_start_ts)
+            else:
+                elapsed = 0
+            done = self.success_count + self.cached_count + self.pulled + self.failure_count
+            return {
+                "active": list(self.active.values()),
+                "completed": self.completed[-60:],
+                "failures": self.failures,
+                "pulled": self.pulled,
+                "success": self.success_count,
+                "failure": self.failure_count,
+                "cached": self.cached_count,
+                "done": done,
+                "total": self.total_elements,
+                "recent": self.recent_lines[-80:],
+                "elapsed": elapsed,
+                "live": live,
+                "catching_up": self.catching_up,
+                "build_running": build_running(),
+                "version": self.version,
+            }
+
+    def update(self, fn):
+        with self._lock:
+            fn(self)
+            self.version += 1
+
+
+STATE = State()
+
+# ── Log parser ─────────────────────────────────────────────────────────────────
+
+def reset_state():
+    """Reset state for a new build (log was truncated/rotated)."""
+    def _reset(s):
+        s.active.clear()
+        s.completed.clear()
+        s.failures.clear()
+        s._summary_elements.clear()
+        s.pulled = 0
+        s.success_count = 0
+        s.failure_count = 0
+        s.cached_count = 0
+        # Keep total_elements across resets — stable between runs
+        s.recent_lines.clear()
+        s.build_start_ts = 0.0
+        s.build_end_ts = 0.0
+        s.catching_up = True
+    STATE.update(_reset)
+
+
+def parse_line(raw: str):
+    clean = ANSI.sub("", raw).rstrip()
+    if not clean:
+        return
+
+    # Detect new build header ("=== Build started at ... ===")
+    hm = BUILD_HEADER_RE.search(clean)
+    if hm:
+        try:
+            # e.g. "Tue Apr 22 03:21:55 IST 2026" — strip timezone abbrev for parsing
+            date_str = re.sub(r'\s+[A-Z]{2,5}\s+', ' ', hm.group(1))
+            ts = datetime.datetime.strptime(date_str.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except Exception:
+            ts = time.time()
+        def _set_start(s):
+            s.active.clear()
+            s.completed.clear()
+            s.failures.clear()
+            s._summary_elements.clear()
+            s.pulled = 0
+            s.success_count = 0
+            s.failure_count = 0
+            s.cached_count = 0
+            s.recent_lines.clear()
+            s.build_end_ts = 0.0
+            s.catching_up = True
+            s.build_start_ts = ts
+            s.recent_lines.append(clean)
+        STATE.update(_set_start)
+        return
+
+    # Pipeline Summary lines (unstructured, no BST prefix)
+    # "Pipeline Summary" → build has ended; freeze state.
+    # The BST "Failure Summary" block appears BEFORE "Pipeline Summary" in the log,
+    # so by this point _summary_elements is fully populated. Filter out cascade
+    # failures (elements that failed only because a dependency failed, not listed
+    # in the Failure Summary).
+    if PIPELINE_SUMMARY_RE.match(clean):
+        def _pipeline_done(s):
+            s.active.clear()
+            s.catching_up = False
+            if not s.build_end_ts:
+                s.build_end_ts = time.time()
+            if s._summary_elements:
+                # Keep only root-cause failures (those in the Failure Summary).
+                # Also reset counters — each Pipeline Summary is authoritative for
+                # its sub-run; failures from prior sub-runs are superseded.
+                s.failures = [f for f in s.failures if f["element"] in s._summary_elements]
+                s.failure_count = len(s.failures)
+            # Clear for next sub-run (BST emits multiple Pipeline Summary blocks
+            # in one session without a new "Build started" header)
+            s._summary_elements.clear()
+            s.recent_lines.append(clean)
+        STATE.update(_pipeline_done)
+        return
+
+    tm = SUMMARY_TOTAL_RE.match(clean)
+    if tm:
+        total = int(tm.group(1))
+        def _set_total(s):
+            s.total_elements = total
+        STATE.update(_set_total)
+
+    qm = SUMMARY_QUEUE_RE.match(clean)
+    if qm and qm.group(1) == "Build":
+        failed = int(qm.group(4))
+        # cached_count and pulled are already tracked live from SKIPPED/SUCCESS Pull events.
+        # Only back-fill failure_count from summary if we missed live FAILURE events.
+        def _backfill_failures(s, _fl=failed):
+            if s.failure_count == 0 and _fl > 0:
+                s.failure_count = _fl
+        STATE.update(_backfill_failures)
+
+    # Failure Summary element lines: "    kde-build-meta.bst:kde/plasma/foo.bst:"
+    # These are root-cause failures only (BST omits cascade failures from this section).
+    fm = FAILURE_ELEM_RE.match(clean)
+    if fm:
+        raw_elem = clean.strip().rstrip(":")
+        short_elem = raw_elem.split(":")[-1]
+        def _add_failure_elem(s, _e=short_elem):
+            s._summary_elements.add(_e)
+            if not any(f["element"] == _e for f in s.failures):
+                s.failures.append({"element": _e, "hash": "", "duration": 0, "status": "failure", "log": ""})
+                s.failure_count = max(s.failure_count, len(s.failures))
+        STATE.update(_add_failure_elem)
+
+    # Log path line inside failure detail: attach to most recent failure without a log
+    lm = BST_LOG_PATH_RE.match(clean)
+    if lm:
+        bst_logs = os.path.expanduser("~/.cache/buildstream/logs")
+        host_log = os.path.join(bst_logs, lm.group(1))
+        def _set_fail_log(s, _p=host_log):
+            for f in reversed(s.failures):
+                if not f.get("log"):
+                    f["log"] = _p
+                    break
+        STATE.update(_set_fail_log)
+
+    m = LINE_RE.match(clean)
+    if not m:
+        # Skip deeply-indented lines — these are embedded log/compile output from
+        # the Failure Summary block and shouldn't appear in the Recent Log panel.
+        if not clean.startswith("        "):
+            trunc = clean[:200]
+            def _add(s, _l=trunc):
+                s.recent_lines.append(_l)
+            STATE.update(_add)
+        return
+
+    status   = m.group("status").strip()
+    ctx      = m.group("ctx").strip()
+    bst_hash = m.group("hash").strip()
+    msg      = m.group("msg").strip()
+
+    cm      = ELEMENT_RE.match(ctx)
+    action  = cm.group(1) if cm else ctx
+    element = cm.group(2).split(":")[-1] if cm else ctx
+
+    short = element
+    for prefix in ("kde-build-meta.bst:", "freedesktop-sdk.bst:", "gnome-build-meta.bst:"):
+        short = short.replace(prefix, "")
+
+    is_top = bool(BUILD_LOG_RE.search(msg))
+
+    def _add_recent(s):
+        s.recent_lines.append(f"[{status:7s}] {short}  {msg}")
+    STATE.update(_add_recent)
+
+    if action == "build" and is_top:
+        if status == "START":
+            # BST emits relative log paths like "gnome/pkg/hash-build.log"
+            # Full path on host: ~/.cache/buildstream/logs/<relative>
+            bst_logs = os.path.expanduser("~/.cache/buildstream/logs")
+            host_log = os.path.join(bst_logs, msg) if msg.endswith(".log") else ""
+            def _start(s, _log=host_log):
+                s.active[bst_hash] = {
+                    "element": short,
+                    "hash": bst_hash,
+                    "start": time.time(),
+                    "log": _log,
+                }
+            STATE.update(_start)
+
+        elif status == "SUCCESS":
+            def _done(s):
+                entry = s.active.pop(bst_hash, None)
+                dur = int(time.time() - entry["start"]) if entry else 0
+                s.completed.append({"element": short, "hash": bst_hash, "duration": dur, "status": "success"})
+                s.success_count += 1
+                s.build_end_ts = time.time()
+            STATE.update(_done)
+
+        elif status == "FAILURE":
+            # BST top-level failure says "Command failed" (no log path), so don't
+            # require is_top — just check if this hash was actually being tracked.
+            def _fail(s):
+                entry = s.active.pop(bst_hash, None)
+                if entry is None:
+                    return  # sub-event failure we don't care about
+                dur = int(time.time() - entry["start"])
+                item = {"element": short, "hash": bst_hash, "duration": dur,
+                        "status": "failure", "log": entry.get("log", "")}
+                s.completed.append(item)
+                # Avoid duplicates from Failure Summary catch-up
+                if not any(f["hash"] == bst_hash for f in s.failures):
+                    # Update existing catch-up entry if present (same element, no hash)
+                    for f in s.failures:
+                        if f["element"] == short and not f["hash"]:
+                            f.update(item)
+                            break
+                    else:
+                        s.failures.append(item)
+                s.failure_count = len(s.failures)
+                s.build_end_ts = time.time()
+            STATE.update(_fail)
+
+    elif action == "pull":
+        if status == "SKIPPED" and "Pull" in msg:
+            def _skip_pull(s):
+                s.cached_count += 1
+            STATE.update(_skip_pull)
+        elif status == "SUCCESS" and "Pull" in msg:
+            def _pull(s):
+                s.pulled += 1
+            STATE.update(_pull)
+
+
+def tail_log():
+    """Tail LOG_FILE, resetting state if the file is truncated (new build started)."""
+    buf = ""
+    pos = 0
+    while True:
+        try:
+            size = os.path.getsize(LOG_FILE)
+        except FileNotFoundError:
+            time.sleep(2)
+            continue
+
+        if size < pos:
+            # File was truncated — new build started
+            reset_state()
+            pos = 0
+            buf = ""
+
+        if size > pos:
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read(size - pos).decode("utf-8", errors="replace")
+                pos = size
+                buf += chunk
+                lines = buf.split("\n")
+                buf = lines[-1]
+                for line in lines[:-1]:
+                    parse_line(line)
+            except Exception:
+                pass
+        elif STATE.catching_up:
+            # We've read everything — mark catch-up complete
+            def _done_catching_up(s):
+                s.catching_up = False
+                # If no active jobs and we have data, use log file mtime as end time
+                if not s.active and s.success_count > 0 and not s.build_end_ts:
+                    try:
+                        s.build_end_ts = os.path.getmtime(LOG_FILE)
+                    except Exception:
+                        pass
+            STATE.update(_done_catching_up)
+
+        time.sleep(0.5)
+
+
+# ── HTML ───────────────────────────────────────────────────────────────────────
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BST Build Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #7d8590;
+    --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+    --yellow: #d29922; --orange: #f0883e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Consolas','Menlo',monospace; font-size: 13px; }
+
+  /* ── Header ── */
+  header { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+  header h1 { font-size: 15px; font-weight: 600; color: var(--blue); white-space: nowrap; }
+  .stats { display: flex; gap: 14px; flex-wrap: wrap; }
+  .stat { display: flex; flex-direction: column; align-items: center; }
+  .stat-val { font-size: 20px; font-weight: 700; }
+  .stat-lbl { color: var(--muted); font-size: 11px; }
+  #ctrl-btn { margin-left: auto; padding: 8px 18px; border-radius: 6px; border: 1px solid; background: transparent; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; transition: opacity .15s; touch-action: manipulation; }
+  #ctrl-btn:hover { opacity: .75; }
+  .green { color: var(--green); }
+  .red   { color: var(--red); }
+  .blue  { color: var(--blue); }
+  .yellow{ color: var(--yellow); }
+  .orange{ color: var(--orange); }
+
+  /* ── Progress bar ── */
+  #progress-wrap { padding: 10px 16px 6px; }
+  #progress-bar-bg { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; height: 18px; overflow: hidden; }
+  #progress-bar { height: 100%; display: flex; }
+  .pb-seg { height: 100%; transition: width .4s ease; min-width: 0; }
+  #pb-cached { background: #3a3a4a; }
+  #pb-pulled { background: var(--yellow); }
+  #pb-built  { background: var(--green); }
+  #pb-active { background: var(--blue); opacity: .85; }
+  #pb-failed { background: var(--red); }
+  #progress-label { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; gap: 10px 14px; flex-wrap: wrap; }
+  .pb-legend { display: flex; align-items: center; gap: 4px; }
+  .pb-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 10px; vertical-align: middle; }
+  .badge-live     { background: #1a3a1a; color: var(--green); border: 1px solid var(--green); }
+  .badge-done     { background: #1a2a3a; color: var(--muted); border: 1px solid var(--border); }
+  .badge-loading  { background: #2a2a1a; color: var(--yellow); border: 1px solid var(--yellow); }
+
+  /* ── Panels ── */
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px 16px 20px; height: calc(100vh - 130px); }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+  section h2 { font-size: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--muted); text-transform: uppercase; letter-spacing: .08em; flex-shrink: 0; }
+  .scroll { overflow-y: auto; flex: 1; padding: 8px 12px; -webkit-overflow-scrolling: touch; }
+
+  .job { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; cursor: pointer; touch-action: manipulation; }
+  .job:last-child { border-bottom: none; }
+  .job:hover, .job:active { background: rgba(255,255,255,.04); border-radius: 4px; }
+  .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--blue); animation: pulse 1s infinite; flex-shrink: 0; }
+  .dot-ok  { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .dot-err { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .ename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dur { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+
+  #log-section { grid-column: 1 / -1; }
+  #log-output { font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: var(--muted); }
+  .log-start   { color: var(--blue); }
+  .log-success { color: var(--green); }
+  .log-failure { color: var(--red); }
+  .log-other   { color: var(--muted); }
+
+  .fail-entry { padding: 6px 0; border-bottom: 1px solid var(--border); color: var(--red); cursor: pointer; touch-action: manipulation; }
+  .fail-entry:last-child { border-bottom: none; }
+  .fail-hash { color: var(--muted); font-size: 11px; }
+
+  /* ── Log modal ── */
+  #log-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+  #log-modal.open { display: flex; }
+  #log-modal-box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; width: 90vw; height: 80vh; display: flex; flex-direction: column; overflow: hidden; }
+  #log-modal-title { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  #log-modal-close { margin-left: auto; cursor: pointer; font-size: 22px; line-height: 1; background: none; border: none; color: var(--muted); padding: 4px 8px; touch-action: manipulation; }
+  #log-modal-close:hover, #log-modal-close:active { color: var(--text); }
+  #log-modal-body { flex: 1; overflow-y: auto; padding: 10px 14px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; color: var(--muted); -webkit-overflow-scrolling: touch; }
+
+  /* ── Mobile layout ── */
+  @media (max-width: 640px) {
+    body { font-size: 14px; }
+    header { padding: 10px 12px; gap: 8px 12px; }
+    header h1 { font-size: 14px; }
+    .stat-val { font-size: 18px; }
+    .stats { gap: 10px; }
+    #progress-wrap { padding: 8px 12px 4px; }
+    /* Single-column stacked panels; natural page scroll instead of fixed height */
+    main { grid-template-columns: 1fr; height: auto; padding: 8px 12px 16px; gap: 8px; }
+    #log-section { grid-column: 1; }
+    section { min-height: 120px; max-height: 40vh; }
+    #log-section { max-height: 30vh; }
+    /* Full-screen modal on mobile */
+    #log-modal-box { width: 100vw; height: 100dvh; border-radius: 0; border: none; }
+    #log-modal-body { font-size: 12px; }
+    #ctrl-btn { padding: 8px 14px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚙ BuildStream Dashboard<span id="status-badge" class="badge badge-loading">Loading…</span></h1>
+  <div class="stats">
+
+    <div class="stat"><span class="stat-val green" id="s-ok">0</span><span class="stat-lbl">Built</span></div>
+    <div class="stat"><span class="stat-val blue"  id="s-active">0</span><span class="stat-lbl">Active</span></div>
+    <div class="stat"><span class="stat-val yellow" id="s-pull">0</span><span class="stat-lbl">Pulled</span></div>
+    <div class="stat"><span class="stat-val red"   id="s-fail">0</span><span class="stat-lbl">Failed</span></div>
+    <div class="stat"><span class="stat-val"       id="s-time">0s</span><span class="stat-lbl">Elapsed</span></div>
+  </div>
+  <button id="ctrl-btn" onclick="toggleBuild()" style="color:var(--muted);border-color:var(--border)">…</button>
+</header>
+
+<div id="progress-wrap">
+  <div id="progress-bar-bg">
+    <div id="progress-bar">
+      <div class="pb-seg" id="pb-cached"></div>
+      <div class="pb-seg" id="pb-pulled"></div>
+      <div class="pb-seg" id="pb-built"></div>
+      <div class="pb-seg" id="pb-active"></div>
+      <div class="pb-seg" id="pb-failed"></div>
+    </div>
+  </div>
+  <div id="progress-label">
+    <span class="pb-legend"><span class="pb-dot" style="background:#3a3a4a"></span><span id="lb-cached">0 cached</span></span>
+    <span class="pb-legend"><span class="pb-dot" style="background:var(--yellow)"></span><span id="lb-pulled">0 pulled</span></span>
+    <span class="pb-legend"><span class="pb-dot" style="background:var(--green)"></span><span id="lb-built">0 built</span></span>
+    <span class="pb-legend"><span class="pb-dot" style="background:var(--blue)"></span><span id="lb-active">0 building</span></span>
+    <span class="pb-legend"><span class="pb-dot" style="background:var(--red)"></span><span id="lb-failed">0 failed</span></span>
+    <span id="lb-total" style="margin-left:auto"></span>
+  </div>
+</div>
+
+<main>
+  <section>
+    <h2>Active Jobs</h2>
+    <div class="scroll" id="active-list"></div>
+  </section>
+
+  <section>
+    <h2>Failures</h2>
+    <div class="scroll" id="fail-list"></div>
+  </section>
+
+  <section id="log-section">
+    <h2>Recent Log</h2>
+    <div class="scroll" id="log-scroll">
+      <div id="log-output"></div>
+    </div>
+  </section>
+</main>
+
+<div id="log-modal">
+  <div id="log-modal-box">
+    <div id="log-modal-title">
+      <span id="log-modal-elem"></span>
+      <button id="log-modal-close" onclick="closeLog()">✕</button>
+    </div>
+    <div id="log-modal-body">Loading…</div>
+  </div>
+</div>
+
+<script>
+let lastVersion = -1;
+let autoScroll = true;
+// Resolve API URL relative to where this page is hosted (works under any path prefix)
+const API_URL = new URL('api/state', document.baseURI).href;
+
+// Show connection status in lb-total (does not disturb lb-* siblings)
+document.getElementById('lb-total').textContent = 'Connecting…';
+
+const logScroll = document.getElementById('log-scroll');
+logScroll.addEventListener('scroll', () => {
+  const atBottom = logScroll.scrollHeight - logScroll.scrollTop - logScroll.clientHeight < 40;
+  autoScroll = atBottom;
+});
+
+function fmtDur(s) {
+  if (s < 60) return s + 's';
+  return Math.floor(s/60) + 'm' + (s%60) + 's';
+}
+
+function fmtElapsed(s) {
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const sec = s%60;
+  if (h) return h + 'h' + m + 'm' + sec + 's';
+  if (m) return m + 'm' + sec + 's';
+  return sec + 's';
+}
+
+function colorLine(l) {
+  const esc = (s, cls) => `<span class="${cls}">${s.replace(/</g,'&lt;')}</span>`;
+  if (l.startsWith('[START  ]')) return esc(l, 'log-start');
+  if (l.startsWith('[SUCCESS]')) return esc(l, 'log-success');
+  if (l.startsWith('[FAILURE]')) return esc(l, 'log-failure');
+  return esc(l, 'log-other');
+}
+
+async function poll() {
+  try {
+    const r = await fetch(API_URL);
+    if (!r.ok) { document.getElementById('lb-total').textContent = `API error: HTTP ${r.status}`; return; }
+    const d = await r.json();
+    lastVersion = d.version;
+
+    // Run/stop button
+    const btn = document.getElementById('ctrl-btn');
+    btn.textContent = d.build_running ? '■ Stop Build' : '▶ Start Build';
+    btn.style.color = d.build_running ? 'var(--red)' : 'var(--green)';
+    btn.style.borderColor = d.build_running ? 'var(--red)' : 'var(--green)';
+
+    // Status badge
+    const badge = document.getElementById('status-badge');
+    if (d.catching_up) {
+      badge.className = 'badge badge-loading'; badge.textContent = 'Loading…';
+    } else if (d.live) {
+      badge.className = 'badge badge-live'; badge.textContent = '⚡ Live';
+    } else if (d.success > 0 || d.failure > 0) {
+      badge.className = 'badge badge-done'; badge.textContent = 'Last build (complete)';
+    } else {
+      badge.className = 'badge badge-loading'; badge.textContent = 'No build data';
+    }
+
+    // Stats
+    document.getElementById('s-ok').textContent     = d.success;
+    document.getElementById('s-active').textContent  = d.active.length;
+    document.getElementById('s-pull').textContent    = d.pulled;
+    document.getElementById('s-fail').textContent    = d.failure;
+    document.getElementById('s-time').textContent    = fmtElapsed(d.elapsed);
+
+    // Segmented progress bar
+    const total = d.total || (d.done + d.active.length) || 1;
+    const pct = n => (Math.min(total, n) / total * 100).toFixed(2) + '%';
+    document.getElementById('pb-cached').style.width = pct(d.cached);
+    document.getElementById('pb-pulled').style.width = pct(d.pulled);
+    document.getElementById('pb-built').style.width  = pct(d.success);
+    document.getElementById('pb-active').style.width = pct(d.active.length);
+    document.getElementById('pb-failed').style.width = pct(d.failure);
+    document.getElementById('lb-cached').textContent = d.cached + ' cached';
+    document.getElementById('lb-pulled').textContent = d.pulled + ' pulled';
+    document.getElementById('lb-built').textContent  = d.success + ' built';
+    document.getElementById('lb-active').textContent = d.active.length + ' building';
+    document.getElementById('lb-failed').textContent = d.failure + ' failed';
+    const overallPct = total > 0 ? Math.round(d.done / total * 100) : 0;
+    const suffix = !d.live && d.done > 0 ? ' · last build' : '';
+    document.getElementById('lb-total').textContent =
+      `${d.done}${d.total ? ' / ' + d.total : ''} · ${overallPct}%${suffix}`;
+
+    // Active jobs
+    const activeEl = document.getElementById('active-list');
+    const now = Date.now() / 1000;
+    activeEl.innerHTML = d.active.length === 0
+      ? '<div style="color:var(--muted);padding:8px">No active jobs</div>'
+      : d.active.map(j => {
+          const dur = j.start ? Math.round(now - j.start) : 0;
+          const esc = j.element.replace(/"/g, '&quot;');
+          return `<div class="job" onclick="openLog('${j.hash}','${esc}')"><span class="pulse"></span><span class="ename" title="${esc}">${j.element}</span><span class="dur">${fmtDur(dur)}</span></div>`;
+        }).join('');
+
+    // Failures
+    const failEl = document.getElementById('fail-list');
+    failEl.innerHTML = d.failures.length === 0
+      ? '<div style="color:var(--muted);padding:8px">No failures</div>'
+      : d.failures.map(f => {
+          const esc = f.element.replace(/</g,'&lt;').replace(/"/g,'&quot;');
+          const clickable = f.log ? `onclick="openLogPath('${encodeURIComponent(f.log)}','${esc}')" style="cursor:pointer"` : '';
+          const logIcon = f.log ? ' <span style="color:var(--blue);font-size:10px">[log]</span>' : '';
+          return `<div class="fail-entry" ${clickable}><span class="dot-err"></span> ${esc}${logIcon}<br><span class="fail-hash">${f.hash ? f.hash + ' · ' : ''}${fmtDur(f.duration)}</span></div>`;
+        }).join('');
+
+    // Log
+    const logEl = document.getElementById('log-output');
+    logEl.innerHTML = d.recent.map(colorLine).join('\\n');
+    if (autoScroll) logScroll.scrollTop = logScroll.scrollHeight;
+
+  } catch(e) { document.getElementById('lb-total').textContent = `Fetch error: ${e.message}`; }
+}
+
+let logRefreshTimer = null;
+
+async function openLog(hash, element) {
+  openLogUrl(new URL('api/log?hash=' + hash, document.baseURI).href, element);
+}
+
+async function openLogPath(encodedPath, element) {
+  openLogUrl(new URL('api/log?path=' + encodedPath, document.baseURI).href, element);
+}
+
+function openLogUrl(url, element) {
+  document.getElementById('log-modal-elem').textContent = element;
+  document.getElementById('log-modal-body').textContent = 'Loading…';
+  document.getElementById('log-modal').classList.add('open');
+  clearInterval(logRefreshTimer);
+  refreshLogUrl(url);
+  logRefreshTimer = setInterval(() => refreshLogUrl(url), 2000);
+}
+
+async function refreshLog(hash) {
+  await refreshLogUrl(new URL('api/log?hash=' + hash, document.baseURI).href);
+}
+
+async function refreshLogUrl(url) {
+  try {
+    const r = await fetch(url);
+    const text = await r.text();
+    const body = document.getElementById('log-modal-body');
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+    body.textContent = text;
+    if (atBottom) body.scrollTop = body.scrollHeight;
+  } catch(e) { document.getElementById('log-modal-body').textContent = 'Error: ' + e.message; }
+}
+
+function closeLog() {
+  document.getElementById('log-modal').classList.remove('open');
+  clearInterval(logRefreshTimer);
+  logRefreshTimer = null;
+}
+
+document.getElementById('log-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('log-modal')) closeLog();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLog(); });
+
+async function toggleBuild() {
+  const btn = document.getElementById('ctrl-btn');
+  const running = btn.textContent.includes('Stop');
+  btn.disabled = true;
+  try {
+    await fetch(new URL(running ? 'api/stop' : 'api/start', document.baseURI), {method: 'POST'});
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+poll();
+setInterval(poll, 800);
+</script>
+</body>
+</html>
+"""
+
+# ── HTTP handler ───────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # silence access log
+
+    def _json_reply(self, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _norm_path(self):
+        """Strip /bst prefix so we work both via Caddy and Tailscale Serve directly."""
+        p = self.path.split("?", 1)
+        path = p[0].rstrip("/") or "/"
+        query = p[1] if len(p) > 1 else ""
+        if path.startswith("/bst"):
+            path = path[4:] or "/"
+        return path, query
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        path, _ = self._norm_path()
+        if path == "/api/start":
+            ok = start_build()
+            self._json_reply({"ok": ok})
+        elif path == "/api/stop":
+            ok = stop_build()
+            self._json_reply({"ok": ok})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        path, query = self._norm_path()
+        if path == "/api/state":
+            data = json.dumps(STATE.snapshot()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        elif path == "/api/log":
+            import urllib.parse
+            params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+            log_path = None
+            if "path" in params:
+                # Direct path (for failures) — validate it stays inside buildstream logs
+                candidate = urllib.parse.unquote(params["path"])
+                bst_logs = os.path.expanduser("~/.cache/buildstream/logs")
+                if os.path.abspath(candidate).startswith(bst_logs):
+                    log_path = candidate
+            elif "hash" in params:
+                h = params["hash"]
+                with STATE._lock:
+                    entry = STATE.active.get(h)
+                    if entry:
+                        log_path = entry.get("log")
+            if not log_path or not os.path.exists(log_path):
+                body = b"Log not available"
+                self.send_response(404)
+            else:
+                try:
+                    with open(log_path, "rb") as f:
+                        raw = f.read().decode("utf-8", errors="replace")
+                    lines = ANSI.sub("", raw).splitlines()[-300:]
+                    body = "\n".join(lines).encode()
+                    self.send_response(200)
+                except Exception as e:
+                    body = str(e).encode()
+                    self.send_response(500)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    tailer = threading.Thread(target=tail_log, daemon=True)
+    tailer.start()
+
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"BST Dashboard running at http://localhost:{PORT}/")
+    print(f"Tailing {LOG_FILE}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
