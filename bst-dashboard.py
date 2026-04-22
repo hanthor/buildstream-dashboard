@@ -530,11 +530,36 @@ HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BST Build Dashboard</title>
 <style>
+  /* ── Theme: light default, auto-switch, explicit overrides ── */
   :root {
+    --bg: #ffffff; --surface: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76;
+    --green: #1a7f37; --red: #d1242f; --blue: #0969da;
+    --yellow: #9a6700; --orange: #bc4c00;
+    --cached: #b6bbbf;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #7d8590;
+      --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+      --yellow: #d29922; --orange: #f0883e;
+      --cached: #3a3a4a;
+    }
+  }
+  [data-theme="light"] {
+    --bg: #ffffff; --surface: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76;
+    --green: #1a7f37; --red: #d1242f; --blue: #0969da;
+    --yellow: #9a6700; --orange: #bc4c00;
+    --cached: #b6bbbf;
+  }
+  [data-theme="dark"] {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
     --text: #e6edf3; --muted: #7d8590;
     --green: #3fb950; --red: #f85149; --blue: #58a6ff;
     --yellow: #d29922; --orange: #f0883e;
+    --cached: #3a3a4a;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Consolas','Menlo',monospace; font-size: 13px; }
@@ -548,6 +573,8 @@ HTML = """<!DOCTYPE html>
   .stat-lbl { color: var(--muted); font-size: 11px; }
   #ctrl-btn { margin-left: auto; padding: 8px 18px; border-radius: 6px; border: 1px solid; background: transparent; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; transition: opacity .15s; touch-action: manipulation; }
   #ctrl-btn:hover { opacity: .75; }
+  #theme-btn { padding: 5px 9px; border-radius: 6px; border: 1px solid var(--border); background: transparent; cursor: pointer; font-size: 14px; line-height: 1; color: var(--muted); touch-action: manipulation; }
+  #theme-btn:hover { color: var(--text); }
   .green { color: var(--green); }
   .red   { color: var(--red); }
   .blue  { color: var(--blue); }
@@ -559,7 +586,7 @@ HTML = """<!DOCTYPE html>
   #progress-bar-bg { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; height: 18px; overflow: hidden; }
   #progress-bar { height: 100%; display: flex; }
   .pb-seg { height: 100%; transition: width .4s ease; min-width: 0; }
-  #pb-cached { background: #3a3a4a; }
+  #pb-cached { background: var(--cached); }
   #pb-pulled { background: var(--yellow); }
   #pb-built  { background: var(--green); }
   #pb-active { background: var(--blue); opacity: .85; }
@@ -568,9 +595,9 @@ HTML = """<!DOCTYPE html>
   .pb-legend { display: flex; align-items: center; gap: 4px; }
   .pb-dot { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 10px; vertical-align: middle; }
-  .badge-live     { background: #1a3a1a; color: var(--green); border: 1px solid var(--green); }
-  .badge-done     { background: #1a2a3a; color: var(--muted); border: 1px solid var(--border); }
-  .badge-loading  { background: #2a2a1a; color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-live     { background: color-mix(in srgb, var(--green) 15%, transparent); color: var(--green); border: 1px solid var(--green); }
+  .badge-done     { background: color-mix(in srgb, var(--blue)  10%, transparent); color: var(--muted); border: 1px solid var(--border); }
+  .badge-loading  { background: color-mix(in srgb, var(--yellow) 15%, transparent); color: var(--yellow); border: 1px solid var(--yellow); }
 
   /* ── Panels ── */
   main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px 16px 20px; height: calc(100vh - 130px); }
@@ -580,7 +607,7 @@ HTML = """<!DOCTYPE html>
 
   .job { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; cursor: pointer; touch-action: manipulation; }
   .job:last-child { border-bottom: none; }
-  .job:hover, .job:active { background: rgba(255,255,255,.04); border-radius: 4px; }
+  .job:hover, .job:active { background: color-mix(in srgb, var(--text) 5%, transparent); border-radius: 4px; }
   .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--blue); animation: pulse 1s infinite; flex-shrink: 0; }
   .dot-ok  { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
   .dot-err { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
@@ -647,6 +674,7 @@ HTML = """<!DOCTYPE html>
     <div class="stat"><span class="stat-val red"   id="s-fail">0</span><span class="stat-lbl">Failed</span></div>
     <div class="stat"><span class="stat-val"       id="s-time">0s</span><span class="stat-lbl">Elapsed</span></div>
   </div>
+  <button id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark">◐</button>
   <button id="ctrl-btn" onclick="toggleBuild()" style="color:var(--muted);border-color:var(--border)">…</button>
 </header>
 
@@ -661,7 +689,7 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div id="progress-label">
-    <span class="pb-legend"><span class="pb-dot" style="background:#3a3a4a"></span><span id="lb-cached">0 cached</span></span>
+    <span class="pb-legend"><span class="pb-dot" style="background:var(--cached)"></span><span id="lb-cached">0 cached</span></span>
     <span class="pb-legend"><span class="pb-dot" style="background:var(--yellow)"></span><span id="lb-pulled">0 pulled</span></span>
     <span class="pb-legend"><span class="pb-dot" style="background:var(--green)"></span><span id="lb-built">0 built</span></span>
     <span class="pb-legend"><span class="pb-dot" style="background:var(--blue)"></span><span id="lb-active">0 building</span></span>
@@ -718,6 +746,29 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+// ── Theme ──────────────────────────────────────────────────────────────────
+(function() {
+  const stored = localStorage.getItem('bst-theme');
+  if (stored) document.documentElement.dataset.theme = stored;
+})();
+
+function _currentTheme() {
+  return document.documentElement.dataset.theme ||
+    (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+function toggleTheme() {
+  const next = _currentTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('bst-theme', next);
+  _updateThemeBtn();
+}
+function _updateThemeBtn() {
+  document.getElementById('theme-btn').textContent = _currentTheme() === 'dark' ? '☀' : '☾';
+}
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', _updateThemeBtn);
+_updateThemeBtn();
+
+// ── Dashboard ───────────────────────────────────────────────────────────────
 let lastVersion = -1;
 let autoScroll = true;
 // Resolve API URL relative to where this page is hosted (works under any path prefix)
