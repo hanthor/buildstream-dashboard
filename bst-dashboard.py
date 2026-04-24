@@ -26,6 +26,11 @@ import threading
 import subprocess
 import multiprocessing
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in a separate thread."""
+    daemon_threads = True
 
 _DEFAULT_BST2_IMAGE = (
     "registry.gitlab.com/freedesktop-sdk/infrastructure/"
@@ -58,6 +63,11 @@ BST2_IMAGE  = _args.bst_image or os.environ.get("BST2_IMAGE",           _DEFAULT
 BUILD_LOCK = threading.Lock()
 BUILD_PROC: "subprocess.Popen | None" = None
 
+_sysinfo_lock = threading.Lock()
+_sysinfo = {"cpu_pct": 0.0, "cpu_cores": [], "mem_used": 0, "mem_total": 0,
+            "bst_cpu_pct": None, "bst_mem": None, "cpu_temp": None,
+            "bst_running": False}
+_cpu_prev: list[tuple[int, int]] = []   # list of (idle_ticks, total_ticks)
 
 def _bst_container_id() -> str:
     """Return container ID of any running BST2 container, or empty string."""
@@ -74,7 +84,8 @@ def _bst_container_id() -> str:
 def build_running() -> bool:
     if BUILD_PROC is not None and BUILD_PROC.poll() is None:
         return True
-    return bool(_bst_container_id())
+    with _sysinfo_lock:
+        return _sysinfo.get("bst_running", False)
 
 
 def start_build() -> bool:
@@ -150,12 +161,20 @@ BST_LOG_PATH_RE = re.compile(r"^\s+/root/\.cache/buildstream/logs/(\S+\.log)\s*$
 # Parse element name from context
 ELEMENT_RE = re.compile(r"\s*(\w+):(.+)")
 
+# cmake/ninja/meson build progress markers in element logs: "[  42/1234]"
+CMAKE_PROGRESS_RE = re.compile(r'\[\s*(\d+)/\s*(\d+)\]')
+# Rust/cargo: "   Compiling foo v1.2.3" lines
+RUST_COMPILE_RE   = re.compile(r'^\s+Compiling\s+\S+\s+v\S')
+# Rust/cargo: "    Finished [optimized] target(s)"
+RUST_FINISHED_RE  = re.compile(r'^\s+Finished\s')
+
 # ── State ──────────────────────────────────────────────────────────────────────
 
 class State:
     def __init__(self):
         self._lock = threading.Lock()
         self.active: dict = {}
+        self.active_pulls: dict = {}   # bst_hash -> {element, short, start}
         self.completed: list = []
         self.failures: list = []
         self._summary_elements: set = set()  # elements named in BST Failure Summary
@@ -173,7 +192,7 @@ class State:
 
     def snapshot(self):
         with self._lock:
-            live = bool(self.active) or self.catching_up
+            live = bool(self.active) or bool(self.active_pulls) or self.catching_up
             if live:
                 # Build is running: elapsed = now - start
                 elapsed = int(time.time() - self.build_start_ts) if self.build_start_ts else 0
@@ -185,6 +204,7 @@ class State:
             done = self.success_count + self.cached_count + self.pulled + self.failure_count
             return {
                 "active": list(self.active.values()),
+                "active_pulls": list(self.active_pulls.values()),
                 "completed": self.completed[-60:],
                 "failures": self.failures,
                 "pulled": self.pulled,
@@ -210,22 +230,130 @@ class State:
 
 STATE = State()
 
+# ── cmake progress enrichment ──────────────────────────────────────────────────
+
+def _enrich_cmake(snap: dict):
+    """Read last 8 KB of each active job's log and inject build progress info.
+
+    Sets one of:
+      cmake_done / cmake_total  — cmake/ninja/meson [x/y] markers
+      rust_crates               — count of Rust "Compiling" lines seen
+    """
+    for job in snap.get("active", []):
+        log_path = job.get("log", "")
+        if not log_path:
+            continue
+        try:
+            size = os.path.getsize(log_path)
+            with open(log_path, "rb") as f:
+                f.seek(max(0, size - 8192))
+                tail = f.read().decode("utf-8", errors="replace")
+            # cmake / ninja / meson: prefer [x/y] markers (most reliable)
+            matches = CMAKE_PROGRESS_RE.findall(tail)
+            if matches:
+                done_s, total_s = matches[-1]
+                job["cmake_done"]  = int(done_s)
+                job["cmake_total"] = int(total_s)
+                continue
+            # Rust/cargo: count "Compiling" lines in the tail
+            rust_lines = RUST_COMPILE_RE.findall(tail)
+            if rust_lines:
+                job["rust_crates"] = len(rust_lines)
+                job["rust_done"]   = not bool(RUST_FINISHED_RE.search(tail))
+        except Exception:
+            pass
+
+# ── Dependency tree ────────────────────────────────────────────────────────────
+
+_deptree_lock = threading.Lock()
+_deptree: dict = {"status": "idle", "nodes": {}, "root": ""}
+
+
+def _fetch_deptree():
+    """Run bst show in the BST container and populate _deptree (background thread)."""
+    global _deptree
+    with _deptree_lock:
+        if _deptree["status"] == "loading":
+            return   # already in progress
+        _deptree = {"status": "loading", "nodes": {}, "root": BST_TARGET}
+
+    try:
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "buildstream")
+        result = subprocess.run(
+            [
+                "podman", "run", "--rm",
+                "--privileged", "--device", "/dev/fuse", "--network=host",
+                "-v", f"{PROJECT_DIR}:/src:rw",
+                "-v", f"{cache_dir}:/root/.cache/buildstream:rw",
+                "-w", "/src",
+                BST2_IMAGE,
+                "bst", "show", "--deps", "all",
+                "--format", "%{name}\t%{deps}\n",
+                BST_TARGET,
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip()[-500:] or "bst show failed")
+        # %{deps} outputs YAML block-sequence format, e.g.:
+        #   name.bst\t- dep1.bst
+        #   - dep2.bst
+        #   - dep3.bst
+        # or "[]" for no deps.  We accumulate continuation "- dep" lines
+        # into the current element's dep list.
+        nodes: dict[str, list] = {}
+        current_name: "str | None" = None
+        current_deps: list = []
+
+        def _flush():
+            if current_name is not None:
+                nodes[current_name] = current_deps[:]
+
+        for raw_line in result.stdout.splitlines():
+            if "\t" in raw_line:
+                _flush()
+                name_part, dep_part = raw_line.split("\t", 1)
+                current_name = name_part.strip()
+                current_deps = []
+                dep_part = dep_part.strip()
+                if dep_part and dep_part != "[]":
+                    dep = dep_part.lstrip("-").strip()
+                    if dep:
+                        current_deps.append(dep)
+            elif current_name is not None:
+                stripped = raw_line.strip()
+                if stripped.startswith("-"):
+                    dep = stripped.lstrip("-").strip()
+                    if dep:
+                        current_deps.append(dep)
+        _flush()
+
+        with _deptree_lock:
+            _deptree = {"status": "ready", "nodes": nodes, "root": BST_TARGET}
+    except Exception as exc:
+        with _deptree_lock:
+            _deptree = {"status": "error", "nodes": {}, "root": BST_TARGET,
+                        "error": str(exc)[:500]}
+
 # ── System resource sampling ───────────────────────────────────────────────────
 
-_sysinfo_lock = threading.Lock()
-_sysinfo = {"cpu_pct": 0.0, "mem_used": 0, "mem_total": 0,
-            "bst_cpu_pct": None, "bst_mem": None}
-_cpu_prev: tuple = (0, 0)   # (idle_ticks, total_ticks)
-
-
-def _read_proc_stat() -> tuple[int, int]:
-    """Return (idle_ticks, total_ticks) from /proc/stat aggregate cpu line."""
-    with open("/proc/stat") as f:
-        parts = f.readline().split()          # cpu  user nice system idle iowait ...
-    vals = list(map(int, parts[1:8]))          # user nice system idle iowait irq softirq
-    idle  = vals[3] + vals[4]                  # idle + iowait
-    total = sum(vals)
-    return idle, total
+def _read_proc_stat() -> list[tuple[int, int]]:
+    """Return a list of (idle_ticks, total_ticks), first entry is aggregate."""
+    stats = []
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if not line.startswith("cpu"):
+                    break
+                parts = line.split()
+                # cpu  user nice system idle iowait irq softirq ...
+                vals = list(map(int, parts[1:8]))
+                idle  = vals[3] + vals[4]
+                total = sum(vals)
+                stats.append((idle, total))
+    except Exception:
+        pass
+    return stats
 
 
 def _read_proc_meminfo() -> tuple[int, int]:
@@ -240,9 +368,8 @@ def _read_proc_meminfo() -> tuple[int, int]:
     return (total - avail) * 1024, total * 1024
 
 
-def _bst_container_stats() -> tuple[float | None, int | None]:
+def _bst_container_stats(cid: str) -> tuple[float | None, int | None]:
     """Return (cpu_pct, mem_bytes) for the running BST container, or (None, None)."""
-    cid = _bst_container_id()
     if not cid:
         return None, None
     try:
@@ -270,25 +397,96 @@ def _bst_container_stats() -> tuple[float | None, int | None]:
         return None, None
 
 
+def _get_cpu_temp() -> "float | None":
+    """Return CPU package temperature in °C from hwmon or thermal_zone, or None."""
+    try:
+        hwmon_base = "/sys/class/hwmon"
+        for hwmon_dir in sorted(os.listdir(hwmon_base)):
+            hwmon_path = os.path.join(hwmon_base, hwmon_dir)
+            try:
+                with open(os.path.join(hwmon_path, "name")) as f:
+                    name = f.read().strip()
+            except Exception:
+                continue
+            if name not in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
+                continue
+            # Prefer a sensor labelled "Package id 0", "Tdie", or "Tccd"
+            best = None
+            for fname in sorted(os.listdir(hwmon_path)):
+                if not (fname.startswith("temp") and fname.endswith("_input")):
+                    continue
+                label = ""
+                try:
+                    with open(os.path.join(hwmon_path, fname.replace("_input", "_label"))) as f:
+                        label = f.read().strip()
+                except Exception:
+                    pass
+                try:
+                    with open(os.path.join(hwmon_path, fname)) as f:
+                        val = int(f.read().strip()) / 1000.0
+                except Exception:
+                    continue
+                if any(k in label for k in ("Package", "Tdie", "Tccd")):
+                    return val       # best match — return immediately
+                if best is None:
+                    best = val       # fall back to first sensor in this hwmon
+            if best is not None:
+                return best
+    except Exception:
+        pass
+    # Fallback: thermal_zone
+    try:
+        for zone_dir in sorted(os.listdir("/sys/class/thermal")):
+            if not zone_dir.startswith("thermal_zone"):
+                continue
+            zone_path = os.path.join("/sys/class/thermal", zone_dir)
+            try:
+                with open(os.path.join(zone_path, "type")) as f:
+                    tz_type = f.read().strip().lower()
+                if any(k in tz_type for k in ("cpu", "x86", "acpitz")):
+                    with open(os.path.join(zone_path, "temp")) as f:
+                        return int(f.read().strip()) / 1000.0
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def _sysinfo_sampler():
     global _cpu_prev
     while True:
         try:
-            idle, total = _read_proc_stat()
-            prev_idle, prev_total = _cpu_prev
-            d_total = total - prev_total
-            cpu_pct = round(100.0 * (1.0 - (idle - prev_idle) / d_total), 1) if d_total else 0.0
-            _cpu_prev = (idle, total)
+            stats = _read_proc_stat()
+            if not _cpu_prev or len(_cpu_prev) != len(stats):
+                _cpu_prev = stats
+                time.sleep(1)
+                continue
+
+            cpu_pcts = []
+            for i in range(len(stats)):
+                idle, total = stats[i]
+                prev_idle, prev_total = _cpu_prev[i]
+                d_total = total - prev_total
+                pct = round(100.0 * (1.0 - (idle - prev_idle) / d_total), 1) if d_total else 0.0
+                cpu_pcts.append(max(0.0, min(100.0, pct)))
+
+            _cpu_prev = stats
 
             mem_used, mem_total = _read_proc_meminfo()
-            bst_cpu, bst_mem = _bst_container_stats()
+            cid = _bst_container_id()
+            bst_cpu, bst_mem = _bst_container_stats(cid) if cid else (None, None)
+            cpu_temp = _get_cpu_temp()
 
             with _sysinfo_lock:
-                _sysinfo["cpu_pct"]     = max(0.0, min(100.0, cpu_pct))
+                _sysinfo["cpu_pct"]     = cpu_pcts[0]
+                _sysinfo["cpu_cores"]   = cpu_pcts[1:]
                 _sysinfo["mem_used"]    = mem_used
                 _sysinfo["mem_total"]   = mem_total
                 _sysinfo["bst_cpu_pct"] = bst_cpu
                 _sysinfo["bst_mem"]     = bst_mem
+                _sysinfo["cpu_temp"]    = cpu_temp
+                _sysinfo["bst_running"] = bool(cid)
         except Exception:
             pass
         time.sleep(2)
@@ -303,6 +501,7 @@ def reset_state():
     """Reset state for a new build (log was truncated/rotated)."""
     def _reset(s):
         s.active.clear()
+        s.active_pulls.clear()
         s.completed.clear()
         s.failures.clear()
         s._summary_elements.clear()
@@ -334,6 +533,7 @@ def parse_line(raw: str):
             ts = time.time()
         def _set_start(s):
             s.active.clear()
+            s.active_pulls.clear()
             s.completed.clear()
             s.failures.clear()
             s._summary_elements.clear()
@@ -358,6 +558,7 @@ def parse_line(raw: str):
     if PIPELINE_SUMMARY_RE.match(clean):
         def _pipeline_done(s):
             s.active.clear()
+            s.active_pulls.clear()
             s.catching_up = False
             if not s.build_end_ts:
                 s.build_end_ts = time.time()
@@ -495,14 +696,24 @@ def parse_line(raw: str):
             STATE.update(_fail)
 
     elif action == "pull":
-        if status == "SKIPPED" and "Pull" in msg:
-            def _skip_pull(s):
+        if status == "START":
+            def _pull_start(s, _h=bst_hash, _sh=short):
+                s.active_pulls[_h] = {"element": _sh, "hash": _h, "start": time.time()}
+            STATE.update(_pull_start)
+        elif status == "SKIPPED" and "Pull" in msg:
+            def _skip_pull(s, _h=bst_hash):
+                s.active_pulls.pop(_h, None)
                 s.cached_count += 1
             STATE.update(_skip_pull)
         elif status == "SUCCESS" and "Pull" in msg:
-            def _pull(s):
+            def _pull_done(s, _h=bst_hash):
+                s.active_pulls.pop(_h, None)
                 s.pulled += 1
-            STATE.update(_pull)
+            STATE.update(_pull_done)
+        elif status == "FAILURE":
+            def _pull_fail(s, _h=bst_hash):
+                s.active_pulls.pop(_h, None)
+            STATE.update(_pull_fail)
 
 
 def tail_log():
@@ -637,7 +848,8 @@ HTML = """<!DOCTYPE html>
   .job { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; cursor: pointer; touch-action: manipulation; }
   .job:last-child { border-bottom: none; }
   .job:hover, .job:active { background: color-mix(in srgb, var(--text) 5%, transparent); border-radius: 4px; }
-  .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--blue); animation: pulse 1s infinite; flex-shrink: 0; }
+  .pulse      { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--blue);   animation: pulse 1s infinite; flex-shrink: 0; }
+  .pulse-pull { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); animation: pulse 1.4s infinite; flex-shrink: 0; }
   .dot-ok  { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
   .dot-err { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
@@ -667,10 +879,74 @@ HTML = """<!DOCTYPE html>
   /* ── Sysinfo bar ── */
   #sysinfo-wrap { padding: 2px 16px 8px; display: flex; gap: 20px; flex-wrap: wrap; }
   .si-item { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+  .si-clickable { cursor: pointer; user-select: none; }
+  .si-clickable:hover { color: var(--text); }
   .si-lbl { min-width: 30px; font-weight: 600; }
   .si-bar-bg { width: 80px; height: 7px; background: var(--surface); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
   .si-bar { height: 100%; border-radius: 3px; transition: width .8s ease, background-color .8s; }
   .si-txt { min-width: 54px; }
+  #si-cpu-txt { min-width: 90px; }
+
+  #si-cores-wrap {
+    grid-column: 1 / -1;
+    display: none;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px 16px;
+    padding: 8px 16px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    width: 100%;
+  }
+  #si-cores-wrap.open { display: grid; }
+  .core-item { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); }
+  .core-lbl { min-width: 45px; }
+  .core-bar-bg { flex: 1; height: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 2px; overflow: hidden; }
+  .core-bar { height: 100%; transition: width .8s ease; }
+
+  /* ── cmake mini progress ── */
+  .cmake-bar-bg { height: 3px; background: var(--border); border-radius: 2px; margin-top: 3px; overflow: hidden; }
+  .cmake-bar    { height: 100%; background: var(--blue); border-radius: 2px; transition: width .4s ease; }
+  .cmake-lbl    { font-size: 10px; color: var(--muted); margin-left: auto; white-space: nowrap; }
+
+  /* ── Dependency tree modal ── */
+  #tree-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 200; align-items: center; justify-content: center; }
+  #tree-modal.open { display: flex; }
+  #tree-modal-box  { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; width: 92vw; height: 88vh; display: flex; flex-direction: column; overflow: hidden; }
+  #tree-modal-hdr  { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  #tree-modal-hdr h3 { font-size: 13px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tree-view-btn { padding: 4px 10px; border-radius: 5px; border: 1px solid var(--border); background: transparent; cursor: pointer; font-family: inherit; font-size: 12px; color: var(--muted); }
+  .tree-view-btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+  #tree-modal-close { cursor: pointer; font-size: 22px; line-height: 1; background: none; border: none; color: var(--muted); padding: 4px 8px; }
+  #tree-modal-close:hover { color: var(--text); }
+  #tree-search { padding: 6px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  #tree-search input { width: 100%; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-family: inherit; font-size: 12px; }
+  #tree-body { flex: 1; overflow: auto; padding: 10px 14px; -webkit-overflow-scrolling: touch; }
+  /* Collapsible tree */
+  .tree-list { list-style: none; padding-left: 18px; }
+  .tree-list.root { padding-left: 0; }
+  .tree-list details > summary { cursor: pointer; user-select: none; padding: 2px 0; border-radius: 3px; display: flex; align-items: center; gap: 4px; }
+  .tree-list details > summary:hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+  .tree-node-leaf { padding: 2px 0 2px 20px; display: flex; align-items: center; gap: 4px; }
+  .tree-nm { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .tree-nm:hover { text-decoration: underline; }
+  .tree-nm.highlight { background: color-mix(in srgb, var(--yellow) 30%, transparent); border-radius: 3px; padding: 0 3px; }
+  .tree-nm.selected { background: color-mix(in srgb, var(--blue) 20%, transparent); color: var(--blue); border-radius: 3px; padding: 0 3px; }
+  .tree-cnt { font-size: 10px; color: var(--muted); margin-left: 4px; flex-shrink: 0; }
+  /* Element info strip */
+  #tree-info { border-top: 1px solid var(--border); padding: 8px 14px; font-size: 11px; flex-shrink: 0; display: none; background: var(--bg); }
+  #tree-info .ti-name { font-weight: 600; color: var(--blue); }
+  #tree-info .ti-full { color: var(--muted); font-size: 10px; word-break: break-all; }
+  #tree-info .ti-badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+  #tree-info .ti-badge { font-size: 10px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); }
+  /* SVG tree view */
+  #svg-container { width: 100%; height: 100%; overflow: auto; }
+  #svg-container svg { display: block; }
+  #tree-status { padding: 20px; color: var(--muted); font-size: 13px; }
+  #tree-refresh-btn { padding: 5px 12px; border-radius: 5px; border: 1px solid var(--border); background: transparent; cursor: pointer; font-family: inherit; font-size: 12px; color: var(--blue); }
+
+  @media (max-width: 640px) {
+    #tree-modal-box { width: 100vw; height: 100dvh; border-radius: 0; border: none; }
+  }
 
   /* ── Mobile layout ── */
   @media (max-width: 640px) {
@@ -703,6 +979,8 @@ HTML = """<!DOCTYPE html>
     <div class="stat"><span class="stat-val red"   id="s-fail">0</span><span class="stat-lbl">Failed</span></div>
     <div class="stat"><span class="stat-val"       id="s-time">0s</span><span class="stat-lbl">Elapsed</span></div>
   </div>
+  <button id="tree-btn" onclick="openTree()" title="Dependency tree" style="padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:transparent;cursor:pointer;font-size:13px;color:var(--muted)">🌳</button>
+  <button id="noti-btn" onclick="toggleNotifications()" title="Toggle notifications" style="padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:transparent;cursor:pointer;font-size:13px;color:var(--muted)">🔔</button>
   <button id="theme-btn" onclick="toggleTheme()" title="Toggle light/dark">◐</button>
   <button id="ctrl-btn" onclick="toggleBuild()" style="color:var(--muted);border-color:var(--border)">…</button>
 </header>
@@ -728,7 +1006,7 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div id="sysinfo-wrap">
-  <div class="si-item">
+  <div class="si-item si-clickable" onclick="toggleCores()">
     <span class="si-lbl">CPU</span>
     <div class="si-bar-bg"><div id="si-cpu-bar" class="si-bar" style="width:0%;background:var(--blue)"></div></div>
     <span class="si-txt" id="si-cpu-txt">–</span>
@@ -743,6 +1021,7 @@ HTML = """<!DOCTYPE html>
     <div class="si-bar-bg"><div id="si-bst-bar" class="si-bar" style="width:0%;background:var(--yellow)"></div></div>
     <span class="si-txt" id="si-bst-txt">–</span>
   </div>
+  <div id="si-cores-wrap"></div>
 </div>
 
 <main>
@@ -774,6 +1053,21 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="tree-modal">
+  <div id="tree-modal-box">
+    <div id="tree-modal-hdr">
+      <h3>🌳 Dependency Tree</h3>
+      <button class="tree-view-btn active" id="btn-view-tree" onclick="setTreeView('tree')">Collapsible</button>
+      <button class="tree-view-btn" id="btn-view-graph" onclick="setTreeView('graph')">Family Tree</button>
+      <button id="tree-refresh-btn" onclick="refreshTree()">↺ Refresh</button>
+      <button id="tree-modal-close" onclick="closeTree()">✕</button>
+    </div>
+    <div id="tree-search"><input type="search" id="tree-search-input" placeholder="Search elements…" oninput="filterTree(this.value)"></div>
+    <div id="tree-body"><div id="tree-status" style="color:var(--muted)">Loading dependency tree…</div></div>
+    <div id="tree-info"></div>
+  </div>
+</div>
+
 <script>
 // ── Theme ──────────────────────────────────────────────────────────────────
 (function() {
@@ -797,9 +1091,46 @@ function _updateThemeBtn() {
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', _updateThemeBtn);
 _updateThemeBtn();
 
+function toggleCores() {
+  _showCores = !_showCores;
+  poll();
+}
+
 // ── Dashboard ───────────────────────────────────────────────────────────────
 let lastVersion = -1;
 let autoScroll = true;
+let _showCores = false;
+let _lastLive = null;
+let _notificationsEnabled = localStorage.getItem('bst-notifications') === 'true';
+
+function updateNotiBtn() {
+  const btn = document.getElementById('noti-btn');
+  if (Notification.permission === 'denied') {
+    btn.style.opacity = '0.3';
+    btn.title = 'Notifications blocked by browser';
+  } else {
+    btn.style.color = _notificationsEnabled ? 'var(--blue)' : 'var(--muted)';
+    btn.style.borderColor = _notificationsEnabled ? 'var(--blue)' : 'var(--border)';
+    btn.title = _notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled (click to enable)';
+  }
+}
+
+async function toggleNotifications() {
+  if (Notification.permission === 'default') {
+    const res = await Notification.requestPermission();
+    if (res !== 'granted') { updateNotiBtn(); return; }
+  }
+  _notificationsEnabled = !_notificationsEnabled;
+  localStorage.setItem('bst-notifications', _notificationsEnabled);
+  updateNotiBtn();
+}
+
+function showBuildNotification(d) {
+  if (!_notificationsEnabled || Notification.permission !== 'granted' || document.visibilityState === 'visible') return;
+  const title = d.failure > 0 ? 'Build Failed ❌' : 'Build Complete ✓';
+  const body = `${d.success} built, ${d.failure} failed, ${d.cached} cached.\nElapsed: ${fmtElapsed(d.elapsed)}`;
+  new Notification(title, { body, icon: '/favicon.ico' });
+}
 // Resolve API URL relative to where this page is hosted (works under any path prefix)
 const API_URL = new URL('api/state', document.baseURI).href;
 
@@ -840,6 +1171,13 @@ async function poll() {
     if (!r.ok) { document.getElementById('lb-total').textContent = `API error: HTTP ${r.status}`; return; }
     const d = await r.json();
     lastVersion = d.version;
+    _lastBuildState = d;
+
+    // Trigger notification on completion
+    if (_lastLive === true && d.live === false && !d.catching_up) {
+      showBuildNotification(d);
+    }
+    _lastLive = d.live;
 
     // Run/stop button
     const btn = document.getElementById('ctrl-btn');
@@ -852,7 +1190,9 @@ async function poll() {
     if (d.catching_up) {
       badge.className = 'badge badge-loading'; badge.textContent = 'Loading…';
     } else if (d.live) {
-      badge.className = 'badge badge-live'; badge.textContent = '⚡ Live';
+      const pullCount = (d.active_pulls || []).length;
+      badge.className = 'badge badge-live';
+      badge.textContent = pullCount > 0 && d.active.length === 0 ? `⬇ Fetching (${pullCount})` : '⚡ Live';
     } else if (d.success > 0 || d.failure > 0) {
       badge.className = 'badge badge-done'; badge.textContent = 'Last build (complete)';
     } else {
@@ -890,7 +1230,24 @@ async function poll() {
     const cpuColor = cpuPct > 85 ? 'var(--red)' : cpuPct > 60 ? 'var(--yellow)' : 'var(--blue)';
     document.getElementById('si-cpu-bar').style.width = cpuPct + '%';
     document.getElementById('si-cpu-bar').style.background = cpuColor;
-    document.getElementById('si-cpu-txt').textContent = cpuPct.toFixed(1) + '%';
+    const tempStr = si.cpu_temp != null ? ' ' + Math.round(si.cpu_temp) + '°C' : '';
+    document.getElementById('si-cpu-txt').textContent = cpuPct.toFixed(1) + '%' + tempStr;
+
+    // Per-core bars
+    const coresWrap = document.getElementById('si-cores-wrap');
+    if (_showCores && si.cpu_cores && si.cpu_cores.length > 0) {
+      coresWrap.classList.add('open');
+      coresWrap.innerHTML = si.cpu_cores.map((pct, i) => {
+        const cColor = pct > 85 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--blue)';
+        return `<div class="core-item"><span class="core-lbl">Core ${i}</span>` +
+          `<div class="core-bar-bg"><div class="core-bar" style="width:${pct}%;background-color:${cColor}"></div></div>` +
+          `<span style="min-width:30px;text-align:right">${Math.round(pct)}%</span></div>`;
+      }).join('');
+    } else {
+      coresWrap.classList.remove('open');
+      coresWrap.innerHTML = '';
+    }
+
     if (si.mem_total) {
       const memPct = Math.round(si.mem_used / si.mem_total * 100);
       const memColor = memPct > 85 ? 'var(--red)' : memPct > 65 ? 'var(--yellow)' : 'var(--green)';
@@ -914,13 +1271,47 @@ async function poll() {
     // Active jobs
     const activeEl = document.getElementById('active-list');
     const now = Date.now() / 1000;
-    activeEl.innerHTML = d.active.length === 0
-      ? '<div style="color:var(--muted);padding:8px">No active jobs</div>'
-      : d.active.map(j => {
-          const dur = j.start ? Math.round(now - j.start) : 0;
-          const esc = j.element.replace(/"/g, '&quot;');
-          return `<div class="job" onclick="openLog('${j.hash}','${esc}')"><span class="pulse"></span><span class="ename" title="${esc}">${j.element}</span><span class="dur">${fmtDur(dur)}</span></div>`;
-        }).join('');
+    const builds = d.active || [];
+    const pulls  = d.active_pulls || [];
+    if (builds.length === 0 && pulls.length === 0) {
+      activeEl.innerHTML = '<div style="color:var(--muted);padding:8px">No active jobs</div>';
+    } else {
+      const buildHtml = builds.map(j => {
+        const dur = j.start ? Math.round(now - j.start) : 0;
+        const esc = j.element.replace(/"/g, '&quot;');
+        let cmakeHtml = '';
+        if (j.cmake_total) {
+          const cpct = Math.round(j.cmake_done / j.cmake_total * 100);
+          cmakeHtml = `<div style="display:flex;align-items:center;gap:6px;margin-top:1px">` +
+            `<div class="cmake-bar-bg" style="flex:1"><div class="cmake-bar" style="width:${cpct}%"></div></div>` +
+            `<span class="cmake-lbl">${j.cmake_done}/${j.cmake_total}</span></div>`;
+        } else if (j.rust_crates) {
+          cmakeHtml = `<div style="display:flex;align-items:center;gap:6px;margin-top:1px">` +
+            `<span class="cmake-lbl" style="color:var(--orange)">🦀 ${j.rust_crates} crates</span></div>`;
+        }
+        return `<div class="job" style="flex-direction:column;align-items:stretch" onclick="openLog('${j.hash}','${esc}')">` +
+          `<div style="display:flex;align-items:center;gap:8px">` +
+          `<span class="pulse"></span><span class="ename" title="${esc}">${j.element}</span>` +
+          `<span class="dur">${fmtDur(dur)}</span></div>` +
+          cmakeHtml + `</div>`;
+      });
+      // Show up to 8 active pulls; collapse the rest into a count badge
+      const MAX_PULLS = 8;
+      const shownPulls = pulls.slice(0, MAX_PULLS);
+      const pullHtml = shownPulls.map(p => {
+        const dur = p.start ? Math.round(now - p.start) : 0;
+        const esc = p.element.replace(/"/g, '&quot;');
+        return `<div class="job" style="opacity:.85">` +
+          `<span class="pulse-pull"></span>` +
+          `<span class="ename" style="color:var(--yellow)" title="${esc}">${p.element}</span>` +
+          `<span class="dur">${fmtDur(dur)}</span></div>`;
+      });
+      if (pulls.length > MAX_PULLS) {
+        pullHtml.push(`<div style="color:var(--muted);font-size:11px;padding:4px 0 0 16px">` +
+          `+${pulls.length - MAX_PULLS} more pulling…</div>`);
+      }
+      activeEl.innerHTML = buildHtml.join('') + pullHtml.join('');
+    }
 
     // Failures
     const failEl = document.getElementById('fail-list');
@@ -984,11 +1375,382 @@ function closeLog() {
 document.getElementById('log-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('log-modal')) closeLog();
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLog(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closeLog(); closeTree(); }
+});
+
+// ── Dependency tree modal ───────────────────────────────────────────────────
+let _treeData     = null;   // {nodes, root}
+let _treeParents  = {};     // reverse adjacency: name -> [parents]
+let _treeSelected = null;   // currently selected element name
+let _treeView     = 'tree'; // 'tree' | 'graph'
+let _treeFilter   = '';
+let _treePollTimer = null;
+// Last known build state (for status badges in info panel)
+let _lastBuildState = null;
+
+function openTree() {
+  document.getElementById('tree-modal').classList.add('open');
+  if (!_treeData) loadTree();
+}
+function closeTree() {
+  document.getElementById('tree-modal').classList.remove('open');
+  if (_treePollTimer) { clearInterval(_treePollTimer); _treePollTimer = null; }
+}
+function setTreeView(view) {
+  _treeView = view;
+  document.getElementById('btn-view-tree').classList.toggle('active',  view === 'tree');
+  document.getElementById('btn-view-graph').classList.toggle('active', view === 'graph');
+  if (_treeData) renderTree();
+}
+function filterTree(q) {
+  _treeFilter = q.trim().toLowerCase();
+  if (_treeData) renderTree();
+}
+function refreshTree() {
+  _treeData = null; _treeParents = {}; _treeSelected = null;
+  document.getElementById('tree-info').style.display = 'none';
+  fetch(new URL('api/deptree/refresh', document.baseURI), {method:'POST'});
+  loadTree();
+}
+
+function _buildParents(nodes) {
+  const p = {};
+  for (const [name, deps] of Object.entries(nodes)) {
+    for (const dep of deps) { if (!p[dep]) p[dep] = []; p[dep].push(name); }
+  }
+  return p;
+}
+
+function _selectNode(name) {
+  _treeSelected = name;
+  // Update highlight in collapsible tree
+  document.querySelectorAll('#tree-body .tree-nm.selected').forEach(el => el.classList.remove('selected'));
+  document.querySelectorAll(`#tree-body .tree-nm[data-n]`).forEach(el => {
+    if (el.dataset.n === name) el.classList.add('selected');
+  });
+  _updateInfoPanel();
+  if (_treeView === 'graph') renderGraphTree();
+}
+
+function _statusOf(name) {
+  if (!_lastBuildState) return null;
+  const short = name.split(':').pop(); // strip junction prefix
+  const d = _lastBuildState;
+  if (d.active && d.active.some(j => j.element === short)) return 'active';
+  if (d.failures && d.failures.some(f => f.element === short)) return 'failure';
+  if (d.completed && d.completed.some(c => c.element === short && c.status === 'success')) return 'success';
+  return null;
+}
+
+function _updateInfoPanel() {
+  const el = document.getElementById('tree-info');
+  if (!_treeSelected || !_treeData) { el.style.display = 'none'; return; }
+  const name = _treeSelected;
+  const deps = _treeData.nodes[name] || [];
+  const parents = _treeParents[name] || [];
+  const status = _statusOf(name);
+  const statusBadge = status === 'active'  ? `<span class="ti-badge" style="color:var(--blue);border-color:var(--blue)">⚡ building</span>`
+                    : status === 'success' ? `<span class="ti-badge" style="color:var(--green);border-color:var(--green)">✓ built</span>`
+                    : status === 'failure' ? `<span class="ti-badge" style="color:var(--red);border-color:var(--red)">✗ failed</span>`
+                    : '';
+  el.style.display = '';
+  el.innerHTML =
+    `<div class="ti-name">${_shortName(name)}</div>` +
+    `<div class="ti-full">${_escAttr(name)}</div>` +
+    `<div class="ti-badges">` +
+    `<span class="ti-badge">${deps.length} dep${deps.length!==1?'s':''}</span>` +
+    `<span class="ti-badge">${parents.length} needed by</span>` +
+    statusBadge +
+    (parents.length ? `<span class="ti-badge" style="cursor:pointer" onclick="_selectNode(${JSON.stringify(parents[0])})" title="First parent">↑ ${_shortName(parents[0])}</span>` : '') +
+    `</div>`;
+}
+
+async function loadTree() {
+  document.getElementById('tree-body').innerHTML = '<div id="tree-status">Loading dependency tree…</div>';
+  if (_treePollTimer) clearInterval(_treePollTimer);
+  _treePollTimer = setInterval(_pollTree, 1500);
+  await _pollTree();
+}
+
+async function _pollTree() {
+  try {
+    const r = await fetch(new URL('api/deptree', document.baseURI));
+    const d = await r.json();
+    if (d.status === 'ready') {
+      clearInterval(_treePollTimer); _treePollTimer = null;
+      _treeData = d;
+      _treeParents = _buildParents(d.nodes);
+      renderTree();
+    } else if (d.status === 'error') {
+      clearInterval(_treePollTimer); _treePollTimer = null;
+      document.getElementById('tree-body').innerHTML =
+        `<div id="tree-status" style="color:var(--red)">Error: ${d.error || 'unknown'}</div>`;
+    }
+    // else still loading — keep polling
+  } catch(e) {
+    document.getElementById('tree-body').innerHTML =
+      `<div id="tree-status" style="color:var(--red)">Fetch error: ${e.message}</div>`;
+  }
+}
+
+function renderTree() {
+  if (!_treeData) return;
+  if (_treeView === 'graph') renderGraphTree();
+  else renderCollapsibleTree();
+}
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+function _shortName(name) {
+  return name.split('/').pop().replace(/\\.bst$/, '');
+}
+function _escAttr(s) {
+  return s.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+// ── Collapsible tree view — lazy rendering ─────────────────────────────────
+// Nodes are rendered one level at a time. Children are injected into the DOM
+// when the parent <details> is first opened (toggle event, capture phase).
+// When a search filter is active we fall back to a flat filtered list instead,
+// which is always fast regardless of tree size.
+
+function _buildShallowNode(name, ancestors) {
+  const { nodes } = _treeData;
+  const q = _treeFilter;
+  const deps = (nodes[name] || []).filter(d => !ancestors.has(d));
+  const display = _shortName(name);
+  const selClass = name === _treeSelected ? ' selected' : '';
+  const hlClass  = (q && name.toLowerCase().includes(q) ? ' highlight' : '') + selClass;
+  const safe = _escAttr(name);
+  const jname = JSON.stringify(name);
+  const nmSpan = `<span class="tree-nm${hlClass}" data-n="${safe}" title="${safe}" onclick="event.stopPropagation();_selectNode(${jname})">${display}</span>`;
+  if (deps.length === 0) {
+    return `<li><div class="tree-node-leaf">${nmSpan}</div></li>`;
+  }
+  return `<li><details data-node="${safe}"><summary>` +
+    nmSpan +
+    `<span class="tree-cnt">(${deps.length})</span></summary>` +
+    `<ul class="tree-list" data-lazy="${safe}"></ul></details></li>`;
+}
+
+function _lazyExpandNode(ul, name) {
+  const { nodes } = _treeData;
+  // Collect ancestor names by walking up the DOM
+  const ancestors = new Set();
+  let el = ul.parentElement;
+  while (el) {
+    const dn = el.dataset && el.dataset.node;
+    if (dn) ancestors.add(dn);
+    el = el.parentElement;
+  }
+  const deps = (nodes[name] || []).filter(d => !ancestors.has(d));
+  ul.innerHTML = deps.map(d => _buildShallowNode(d, new Set([...ancestors, name]))).join('');
+  delete ul.dataset.lazy;
+}
+
+// Event delegation: capture toggle on any <details> inside #tree-body
+document.getElementById('tree-body').addEventListener('toggle', e => {
+  if (e.target.tagName !== 'DETAILS' || !e.target.open) return;
+  const ul = e.target.querySelector('ul[data-lazy]');
+  if (!ul) return;
+  _lazyExpandNode(ul, ul.dataset.lazy);
+}, true);
+
+function renderCollapsibleTree() {
+  const { nodes, root } = _treeData;
+  const q = _treeFilter;
+  const body = document.getElementById('tree-body');
+
+  if (!q) {
+    // No filter: lazy top-level render (just root + its direct children)
+    const rootDeps = (nodes[root] || []);
+    const rootDisplay = _shortName(root);
+    const safe = _escAttr(root);
+    const jroot = JSON.stringify(root).replace(/</g, '\\u003c');
+    const rootSelClass = root === _treeSelected ? ' selected' : '';
+    const childrenHtml = rootDeps.map(d => _buildShallowNode(d, new Set([root]))).join('');
+    body.innerHTML =
+      `<ul class="tree-list root"><li>` +
+      `<details data-node="${safe}" open><summary>` +
+      `<span class="tree-nm${rootSelClass}" data-n="${safe}" title="${safe}" onclick="event.stopPropagation();_selectNode(${jroot})">${rootDisplay}</span>` +
+      `<span class="tree-cnt">(${rootDeps.length})</span></summary>` +
+      `<ul class="tree-list">${childrenHtml}</ul>` +
+      `</details></li></ul>`;
+    return;
+  }
+
+  // Filter active: build a flat list of matching element names (fast, no recursion)
+  const ql = q.toLowerCase();
+  const matches = Object.keys(nodes).filter(n => n.toLowerCase().includes(ql));
+  if (matches.length === 0) {
+    body.innerHTML = `<div id="tree-status">No elements match "${_escAttr(q)}"</div>`;
+    return;
+  }
+  const MAX_RESULTS = 200;
+  const shown = matches.slice(0, MAX_RESULTS);
+  const more = matches.length > MAX_RESULTS ? `<div style="color:var(--muted);padding:6px">…and ${matches.length - MAX_RESULTS} more</div>` : '';
+  body.innerHTML =
+    `<ul class="tree-list root">` +
+    shown.map(name => {
+      const safe = _escAttr(name);
+      const jname = JSON.stringify(name).replace(/</g, '\\u003c');
+      const deps = (nodes[name] || []);
+      const selClass = name === _treeSelected ? ' selected' : '';
+      return `<li><div class="tree-node-leaf" style="flex-direction:column;align-items:flex-start;cursor:pointer" onclick="_selectNode(${jname})">` +
+        `<span class="tree-nm highlight${selClass}" data-n="${safe}" title="${safe}">${_shortName(name)}</span>` +
+        `<span style="font-size:10px;color:var(--muted);pointer-events:none">${safe}</span>` +
+        (deps.length ? `<span class="tree-cnt" style="pointer-events:none">${deps.length} dep${deps.length>1?'s':''}</span>` : '') +
+        `</div></li>`;
+    }).join('') +
+    `</ul>${more}`;
+}
+
+// ── SVG family-tree view — focused subgraph ───────────────────────────────
+// Shows the immediate neighbourhood of the selected element:
+//   row 0: parents (who depend on it)      [yellow]
+//   row 1: selected element                [blue]
+//   row 2: direct deps (children)          [normal]
+//   row 3: deps of deps (grandchildren)    [muted]
+// Click a node in the Collapsible view first to focus here.
+function renderGraphTree() {
+  const body = document.getElementById('tree-body');
+  if (!_treeSelected) {
+    body.innerHTML = `<div id="tree-status">` +
+      `Click any element in the <strong>Collapsible</strong> view to explore its dependency graph here.</div>`;
+    return;
+  }
+
+  const { nodes } = _treeData;
+  const sel = _treeSelected;
+  const NODE_W = 164, NODE_H = 36, H_GAP = 12, V_GAP = 54;
+  const MAX_PARENTS = 12, MAX_CHILDREN = 20, MAX_GRANDCHILDREN = 4;
+
+  const parents     = (_treeParents[sel] || []).slice(0, MAX_PARENTS);
+  const children    = (nodes[sel] || []).slice(0, MAX_CHILDREN);
+  // Grandchildren: up to MAX_GRANDCHILDREN per child, deduped
+  const gcSeen = new Set([sel, ...parents, ...children]);
+  const grandchildren = [];
+  for (const c of children) {
+    for (const gc of (nodes[c] || []).slice(0, MAX_GRANDCHILDREN)) {
+      if (!gcSeen.has(gc)) { gcSeen.add(gc); grandchildren.push(gc); }
+    }
+  }
+
+  // Levels: parents→0, sel→1, children→2, grandchildren→3
+  const level = {[sel]: 1};
+  parents.forEach(n => level[n] = 0);
+  children.forEach(n => level[n] = 2);
+  grandchildren.forEach(n => level[n] = 3);
+
+  // Edges
+  const edges = [];
+  parents.forEach(p => edges.push([p, sel, 'parent']));
+  children.forEach(c => edges.push([sel, c, 'child']));
+  for (const c of children) {
+    for (const gc of (nodes[c] || []).slice(0, MAX_GRANDCHILDREN)) {
+      if (level[gc] === 3) edges.push([c, gc, 'gc']);
+    }
+  }
+
+  // Position each row: evenly spaced horizontally, centred on sel
+  function rowX(names) {
+    const n = names.length;
+    return names.map((_, i) => (i - (n - 1) / 2) * (NODE_W + H_GAP));
+  }
+  const pos = {};
+  const rows = [parents, [sel], children, grandchildren];
+  rows.forEach((row, ri) => {
+    const xs = rowX(row);
+    row.forEach((name, i) => pos[name] = { x: xs[i], y: ri * (NODE_H + V_GAP) });
+  });
+
+  // SVG bounds
+  const allX = Object.values(pos).map(p => p.x);
+  const PAD = 24;
+  const svgW = Math.max(500, Math.max(...allX) - Math.min(...allX) + NODE_W + PAD * 2);
+  const svgH = (rows.length) * (NODE_H + V_GAP) + PAD * 2;
+  const ox = svgW / 2, oy = PAD;
+
+  const cs = getComputedStyle(document.documentElement);
+  const cBorder  = cs.getPropertyValue('--border').trim();
+  const cText    = cs.getPropertyValue('--text').trim();
+  const cSurface = cs.getPropertyValue('--surface').trim();
+  const cBlue    = cs.getPropertyValue('--blue').trim();
+  const cMuted   = cs.getPropertyValue('--muted').trim();
+  const cYellow  = cs.getPropertyValue('--yellow').trim();
+  const cGreen   = cs.getPropertyValue('--green').trim();
+  const cRed     = cs.getPropertyValue('--red').trim();
+
+  function nodeColor(name) {
+    const s = _statusOf(name);
+    return s === 'active' ? cBlue : s === 'success' ? cGreen : s === 'failure' ? cRed : cBorder;
+  }
+
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" style="font-family:monospace">`;
+
+  // Row labels
+  const labels = ['needed by', '', 'depends on', 'dep of dep'];
+  rows.forEach((row, ri) => {
+    if (!row.length || ri === 1) return;
+    const ry = ri * (NODE_H + V_GAP) + oy + NODE_H / 2 + 4;
+    const lx = svgW - 4;
+    svg += `<text x="${lx}" y="${ry}" text-anchor="end" fill="${cMuted}" font-size="9">${labels[ri]} (${row.length})</text>`;
+  });
+
+  // Edges
+  for (const [a, b] of edges) {
+    if (!pos[a] || !pos[b]) continue;
+    const x1 = pos[a].x + ox, y1 = pos[a].y + oy + NODE_H;
+    const x2 = pos[b].x + ox, y2 = pos[b].y + oy;
+    const my = (y1 + y2) / 2;
+    svg += `<path d="M${x1} ${y1} C${x1} ${my},${x2} ${my},${x2} ${y2}" fill="none" stroke="${cBorder}" stroke-width="1.2" opacity="0.7"/>`;
+  }
+
+  // Nodes — use data-name for click binding (avoid inline onclick escaping issues)
+  const nodeNames = [];
+  for (const [name, {x, y}] of Object.entries(pos)) {
+    const idx = nodeNames.length;
+    nodeNames.push(name);
+    const rx = x + ox - NODE_W / 2, ry = y + oy;
+    const isSel = name === sel;
+    const stroke = isSel ? cBlue : nodeColor(name);
+    const sw = isSel ? 2.5 : 1.2;
+    // SVG fill can't use color-mix() — use a plain color for selection
+    const fill = isSel ? (document.documentElement.dataset.theme === 'light' ? '#dbeafe' : '#1e3a5f') : cSurface;
+    const textColor = isSel ? cBlue : cText;
+    const display = _shortName(name);
+    const trunc = display.length > 21 ? display.slice(0, 19) + '…' : display;
+    svg += `<g class="svg-nd" data-idx="${idx}" style="cursor:pointer">` +
+      `<rect x="${rx}" y="${ry}" width="${NODE_W}" height="${NODE_H}" rx="5" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>` +
+      `<text x="${rx + NODE_W/2}" y="${ry + NODE_H/2 + 4}" text-anchor="middle" fill="${textColor}" font-size="10">${trunc}</text>` +
+      `</g>`;
+  }
+
+  // Truncation notes
+  const pMore = (_treeParents[sel] || []).length - parents.length;
+  const cMore = (nodes[sel] || []).length - children.length;
+  if (pMore > 0) svg += `<text x="${svgW/2}" y="${oy - 6}" text-anchor="middle" fill="${cMuted}" font-size="9">+${pMore} more parents not shown</text>`;
+  if (cMore > 0) svg += `<text x="${svgW/2}" y="${svgH - 4}" text-anchor="middle" fill="${cMuted}" font-size="9">+${cMore} more deps not shown</text>`;
+
+  svg += '</svg>';
+  body.innerHTML = `<div id="svg-container">${svg}</div>`;
+
+  // Wire click/tap handlers after DOM insertion
+  body.querySelectorAll('.svg-nd').forEach(el => {
+    const name = nodeNames[parseInt(el.dataset.idx)];
+    el.addEventListener('click', () => _selectNode(name));
+  });
+}
+
+document.getElementById('tree-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('tree-modal')) closeTree();
+});
 
 async function toggleBuild() {
   const btn = document.getElementById('ctrl-btn');
   const running = btn.textContent.includes('Stop');
+  const msg = running ? 'Stop the running build?' : 'Start a new build?';
+  if (!confirm(msg)) return;
   btn.disabled = true;
   try {
     await fetch(new URL(running ? 'api/stop' : 'api/start', document.baseURI), {method: 'POST'});
@@ -999,6 +1761,7 @@ async function toggleBuild() {
 
 poll();
 setInterval(poll, 800);
+updateNotiBtn();
 </script>
 </body>
 </html>
@@ -1038,6 +1801,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/stop":
             ok = stop_build()
             self._json_reply({"ok": ok})
+        elif path == "/api/deptree/refresh":
+            threading.Thread(target=_fetch_deptree, daemon=True).start()
+            self._json_reply({"ok": True})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1045,7 +1811,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path, query = self._norm_path()
         if path == "/api/state":
-            data = json.dumps(STATE.snapshot()).encode()
+            snap = STATE.snapshot()
+            _enrich_cmake(snap)
+            data = json.dumps(snap).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        elif path == "/api/deptree":
+            with _deptree_lock:
+                payload = dict(_deptree)
+            # Auto-trigger fetch if idle
+            if payload["status"] == "idle":
+                threading.Thread(target=_fetch_deptree, daemon=True).start()
+                payload["status"] = "loading"
+            data = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -1102,7 +1884,7 @@ if __name__ == "__main__":
     tailer = threading.Thread(target=tail_log, daemon=True)
     tailer.start()
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"BST Dashboard  http://localhost:{PORT}/")
     print(f"  log:     {LOG_FILE}")
     print(f"  target:  {BST_TARGET}")
