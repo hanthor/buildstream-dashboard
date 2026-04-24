@@ -66,8 +66,9 @@ BUILD_PROC: "subprocess.Popen | None" = None
 _sysinfo_lock = threading.Lock()
 _sysinfo = {"cpu_pct": 0.0, "cpu_cores": [], "mem_used": 0, "mem_total": 0,
             "bst_cpu_pct": None, "bst_mem": None, "cpu_temp": None,
-            "bst_running": False}
+            "bst_running": False, "net_rx_bps": 0.0, "net_tx_bps": 0.0}
 _cpu_prev: list[tuple[int, int]] = []   # list of (idle_ticks, total_ticks)
+_net_prev: "tuple[int, int, float] | None" = None  # (rx_bytes, tx_bytes, timestamp)
 
 def _bst_container_id() -> str:
     """Return container ID of any running BST2 container, or empty string."""
@@ -453,8 +454,29 @@ def _get_cpu_temp() -> "float | None":
     return None
 
 
+def _read_proc_net_dev() -> tuple[int, int]:
+    """Return (total_rx_bytes, total_tx_bytes) across all non-loopback interfaces."""
+    rx_total = tx_total = 0
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                line = line.strip()
+                if ":" not in line:
+                    continue
+                iface, data = line.split(":", 1)
+                if iface.strip() == "lo":
+                    continue
+                fields = data.split()
+                if len(fields) >= 9:
+                    rx_total += int(fields[0])   # rx bytes
+                    tx_total += int(fields[8])   # tx bytes
+    except Exception:
+        pass
+    return rx_total, tx_total
+
+
 def _sysinfo_sampler():
-    global _cpu_prev
+    global _cpu_prev, _net_prev
     while True:
         try:
             stats = _read_proc_stat()
@@ -478,6 +500,18 @@ def _sysinfo_sampler():
             bst_cpu, bst_mem = _bst_container_stats(cid) if cid else (None, None)
             cpu_temp = _get_cpu_temp()
 
+            # Network speed
+            now_t = time.time()
+            rx, tx = _read_proc_net_dev()
+            if _net_prev is not None:
+                prev_rx, prev_tx, prev_t = _net_prev
+                dt = now_t - prev_t
+                net_rx_bps = max(0.0, (rx - prev_rx) / dt) if dt > 0 else 0.0
+                net_tx_bps = max(0.0, (tx - prev_tx) / dt) if dt > 0 else 0.0
+            else:
+                net_rx_bps = net_tx_bps = 0.0
+            _net_prev = (rx, tx, now_t)
+
             with _sysinfo_lock:
                 _sysinfo["cpu_pct"]     = cpu_pcts[0]
                 _sysinfo["cpu_cores"]   = cpu_pcts[1:]
@@ -487,6 +521,8 @@ def _sysinfo_sampler():
                 _sysinfo["bst_mem"]     = bst_mem
                 _sysinfo["cpu_temp"]    = cpu_temp
                 _sysinfo["bst_running"] = bool(cid)
+                _sysinfo["net_rx_bps"]  = net_rx_bps
+                _sysinfo["net_tx_bps"]  = net_tx_bps
         except Exception:
             pass
         time.sleep(2)
@@ -787,7 +823,7 @@ HTML = """<!DOCTYPE html>
     --bg: #ffffff; --surface: #f6f8fa; --border: #d0d7de;
     --text: #1f2328; --muted: #656d76;
     --green: #1a7f37; --red: #d1242f; --blue: #0969da;
-    --yellow: #9a6700; --orange: #bc4c00;
+    --yellow: #9a6700; --orange: #bc4c00; --teal: #0e7490;
     --cached: #b6bbbf;
   }
   @media (prefers-color-scheme: dark) {
@@ -795,7 +831,7 @@ HTML = """<!DOCTYPE html>
       --bg: #0d1117; --surface: #161b22; --border: #30363d;
       --text: #e6edf3; --muted: #7d8590;
       --green: #3fb950; --red: #f85149; --blue: #58a6ff;
-      --yellow: #d29922; --orange: #f0883e;
+      --yellow: #d29922; --orange: #f0883e; --teal: #22d3ee;
       --cached: #3a3a4a;
     }
   }
@@ -803,14 +839,14 @@ HTML = """<!DOCTYPE html>
     --bg: #ffffff; --surface: #f6f8fa; --border: #d0d7de;
     --text: #1f2328; --muted: #656d76;
     --green: #1a7f37; --red: #d1242f; --blue: #0969da;
-    --yellow: #9a6700; --orange: #bc4c00;
+    --yellow: #9a6700; --orange: #bc4c00; --teal: #0e7490;
     --cached: #b6bbbf;
   }
   [data-theme="dark"] {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
     --text: #e6edf3; --muted: #7d8590;
     --green: #3fb950; --red: #f85149; --blue: #58a6ff;
-    --yellow: #d29922; --orange: #f0883e;
+    --yellow: #d29922; --orange: #f0883e; --teal: #22d3ee;
     --cached: #3a3a4a;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1033,6 +1069,11 @@ HTML = """<!DOCTYPE html>
     <div class="si-bar-bg"><div id="si-bst-bar" class="si-bar" style="width:0%;background:var(--yellow)"></div></div>
     <span class="si-txt" id="si-bst-txt">–</span>
   </div>
+  <div class="si-item">
+    <span class="si-lbl">NET</span>
+    <div class="si-bar-bg"><div id="si-net-bar" class="si-bar" style="width:0%;background:var(--teal)"></div></div>
+    <span class="si-txt" id="si-net-txt">–</span>
+  </div>
   <div id="si-cores-wrap"></div>
 </div>
 
@@ -1160,6 +1201,13 @@ function fmtDur(s) {
   return Math.floor(s/60) + 'm' + (s%60) + 's';
 }
 
+function fmtBps(bps) {
+  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' GB/s';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' KB/s';
+  return Math.round(bps) + ' B/s';
+}
+
 function fmtElapsed(s) {
   const h = Math.floor(s/3600);
   const m = Math.floor((s%3600)/60);
@@ -1278,6 +1326,18 @@ async function poll() {
       document.getElementById('si-bst-txt').textContent = bstPct.toFixed(1) + '% ' + bstMemGb;
     } else {
       bstWrap.style.display = 'none';
+    }
+
+    // Network speed — bar scaled to 100 MB/s = 100%
+    {
+      const rxBps = si.net_rx_bps || 0;
+      const txBps = si.net_tx_bps || 0;
+      const netPct = Math.min(100, rxBps / 100e6 * 100);
+      const netColor = rxBps > 80e6 ? 'var(--orange)' : 'var(--teal)';
+      document.getElementById('si-net-bar').style.width = netPct + '%';
+      document.getElementById('si-net-bar').style.background = netColor;
+      document.getElementById('si-net-txt').textContent =
+        '\u2193' + fmtBps(rxBps) + ' \u2191' + fmtBps(txBps);
     }
 
     // Active jobs
