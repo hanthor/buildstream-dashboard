@@ -695,20 +695,32 @@ def parse_line(raw: str):
                 s.build_end_ts = time.time()
             STATE.update(_fail)
 
-    elif action == "pull":
+    elif action in ("pull", "fetch"):
         if status == "START":
-            def _pull_start(s, _h=bst_hash, _sh=short):
-                s.active_pulls[_h] = {"element": _sh, "hash": _h, "start": time.time()}
+            def _pull_start(s, _h=bst_hash, _sh=short, _k=action):
+                now = time.time()
+                s.active_pulls[_h] = {"element": _sh, "hash": _h, "kind": _k,
+                                      "start": now, "last_activity": now, "detail": ""}
             STATE.update(_pull_start)
+        elif status in ("STATUS", "INFO", "WARN"):
+            # STATUS lines often carry the URL/source being transferred —
+            # grab the tail so the UI can hint at what's moving.
+            detail = msg[:60] if msg else ""
+            def _pull_activity(s, _h=bst_hash, _d=detail):
+                if _h in s.active_pulls:
+                    s.active_pulls[_h]["last_activity"] = time.time()
+                    s.active_pulls[_h]["detail"] = _d
+            STATE.update(_pull_activity)
         elif status == "SKIPPED" and "Pull" in msg:
             def _skip_pull(s, _h=bst_hash):
                 s.active_pulls.pop(_h, None)
                 s.cached_count += 1
             STATE.update(_skip_pull)
-        elif status == "SUCCESS" and "Pull" in msg:
-            def _pull_done(s, _h=bst_hash):
+        elif status == "SUCCESS":
+            def _pull_done(s, _h=bst_hash, _k=action):
                 s.active_pulls.pop(_h, None)
-                s.pulled += 1
+                if _k == "pull":
+                    s.pulled += 1
             STATE.update(_pull_done)
         elif status == "FAILURE":
             def _pull_fail(s, _h=bst_hash):
@@ -1295,20 +1307,30 @@ async function poll() {
           `<span class="dur">${fmtDur(dur)}</span></div>` +
           cmakeHtml + `</div>`;
       });
+      // Sort pulls: most recently active first (these are actively transferring)
+      const sortedPulls = [...pulls].sort((a, b) =>
+        (b.last_activity || b.start || 0) - (a.last_activity || a.start || 0));
       // Show up to 8 active pulls; collapse the rest into a count badge
       const MAX_PULLS = 8;
-      const shownPulls = pulls.slice(0, MAX_PULLS);
+      const shownPulls = sortedPulls.slice(0, MAX_PULLS);
       const pullHtml = shownPulls.map(p => {
         const dur = p.start ? Math.round(now - p.start) : 0;
         const esc = p.element.replace(/"/g, '&quot;');
-        return `<div class="job" style="opacity:.85">` +
+        const idle = now - (p.last_activity || p.start || now);
+        const idleStyle = idle > 10 ? 'opacity:.5' : '';  // dim stalled pulls
+        const detailHtml = p.detail
+          ? `<div style="font-size:10px;color:var(--muted);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.detail.replace(/</g,'&lt;')}</div>`
+          : '';
+        return `<div class="job" style="flex-direction:column;align-items:stretch;${idleStyle}">` +
+          `<div style="display:flex;align-items:center;gap:8px">` +
           `<span class="pulse-pull"></span>` +
           `<span class="ename" style="color:var(--yellow)" title="${esc}">${p.element}</span>` +
-          `<span class="dur">${fmtDur(dur)}</span></div>`;
+          `<span class="dur">${fmtDur(dur)}</span></div>` +
+          detailHtml + `</div>`;
       });
-      if (pulls.length > MAX_PULLS) {
+      if (sortedPulls.length > MAX_PULLS) {
         pullHtml.push(`<div style="color:var(--muted);font-size:11px;padding:4px 0 0 16px">` +
-          `+${pulls.length - MAX_PULLS} more pulling…</div>`);
+          `+${sortedPulls.length - MAX_PULLS} more pulling…</div>`);
       }
       activeEl.innerHTML = buildHtml.join('') + pullHtml.join('');
     }
